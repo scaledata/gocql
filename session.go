@@ -18,7 +18,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/gocql/gocql/internal/lru"
+	"github.com/scaledata/gocql/internal/lru"
 )
 
 // Session is the interface used by users to interact with the database.
@@ -43,6 +43,7 @@ type Session struct {
 	frameObserver       FrameHeaderObserver
 	hostSource          *ringDescriber
 	stmtsLRU            *preparedLRU
+	skipPrepareStmt     bool
 
 	connCfg *ConnConfig
 
@@ -243,6 +244,8 @@ func (s *Session) init() error {
 		return ErrNoConnectionsStarted
 	}
 
+	s.skipPrepareStmt = false
+
 	return nil
 }
 
@@ -308,6 +311,14 @@ func (s *Session) SetPrefetch(p float64) {
 func (s *Session) SetTrace(trace Tracer) {
 	s.mu.Lock()
 	s.trace = trace
+	s.mu.Unlock()
+}
+
+// SetSkipPrepStmt sets the default way to execute query(prepare and execute or direct execution).
+// This setting can also be changed on a per-query basis.
+func (s *Session) SetSkipPrepStmt(skip bool) {
+	s.mu.Lock()
+	s.skipPrepareStmt = skip
 	s.mu.Unlock()
 }
 
@@ -681,6 +692,7 @@ type Query struct {
 	disableSkipMetadata   bool
 	context               context.Context
 	idempotent            bool
+	skipPrepareStmt       bool
 
 	disableAutoPage bool
 }
@@ -697,6 +709,7 @@ func (q *Query) defaultsFromSession() {
 	q.rt = s.cfg.RetryPolicy
 	q.serialCons = s.cfg.SerialConsistency
 	q.defaultTimestamp = s.cfg.DefaultTimestamp
+	q.skipPrepareStmt = s.skipPrepareStmt
 	q.idempotent = s.cfg.DefaultIdempotence
 	s.mu.RUnlock()
 }
@@ -904,7 +917,9 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 }
 
 func (q *Query) shouldPrepare() bool {
-
+	if q.skipPrepareStmt {
+		return false
+	}
 	stmt := strings.TrimLeftFunc(strings.TrimRightFunc(q.stmt, func(r rune) bool {
 		return unicode.IsSpace(r) || r == ';'
 	}), unicode.IsSpace)

@@ -168,6 +168,25 @@ func TestQueryShouldPrepare(t *testing.T) {
 			t.Fatalf("expected Query.shouldPrepare to return false, got true for statement '%v'", cantPrepare[i])
 		}
 	}
+
+	toPrepare = []string{"select * ", "INSERT INTO", "update table", "delete from", "begin batch"}
+	cantPrepare = []string{"create table", "USE table", "LIST keyspaces", "alter table", "drop table", "grant user", "revoke user"}
+
+	for i := 0; i < len(toPrepare); i++ {
+		q.stmt = toPrepare[i]
+		q.skipPrepareStmt = true
+		if q.shouldPrepare() {
+			t.Fatalf("expected Query.shouldPrepare to return true, got false for statement '%v'", toPrepare[i])
+		}
+	}
+
+	for i := 0; i < len(cantPrepare); i++ {
+		q.stmt = cantPrepare[i]
+		q.skipPrepareStmt = true
+		if q.shouldPrepare() {
+			t.Fatalf("expected Query.shouldPrepare to return false, got true for statement '%v'", cantPrepare[i])
+		}
+	}
 }
 
 func TestBatchBasicAPI(t *testing.T) {
