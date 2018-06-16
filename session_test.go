@@ -174,7 +174,7 @@ func TestQueryShouldPrepare(t *testing.T) {
 
 	for i := 0; i < len(toPrepare); i++ {
 		q.stmt = toPrepare[i]
-		q.skipPrepareStmt = true
+		q.skipPrepStmt = true
 		if q.shouldPrepare() {
 			t.Fatalf("expected Query.shouldPrepare to return true, got false for statement '%v'", toPrepare[i])
 		}
@@ -182,7 +182,7 @@ func TestQueryShouldPrepare(t *testing.T) {
 
 	for i := 0; i < len(cantPrepare); i++ {
 		q.stmt = cantPrepare[i]
-		q.skipPrepareStmt = true
+		q.skipPrepStmt = true
 		if q.shouldPrepare() {
 			t.Fatalf("expected Query.shouldPrepare to return false, got true for statement '%v'", cantPrepare[i])
 		}

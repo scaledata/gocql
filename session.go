@@ -43,7 +43,7 @@ type Session struct {
 	frameObserver       FrameHeaderObserver
 	hostSource          *ringDescriber
 	stmtsLRU            *preparedLRU
-	skipPrepareStmt     bool
+	skipPrepStmt     bool
 
 	connCfg *ConnConfig
 
@@ -116,6 +116,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		stmtsLRU:        &preparedLRU{lru: lru.New(cfg.MaxPreparedStmts)},
 		quit:            make(chan struct{}),
 		connectObserver: cfg.ConnectObserver,
+		skipPrepStmt: cfg.SkipPrepStmt,
 	}
 
 	s.schemaDescriber = newSchemaDescriber(s)
@@ -244,8 +245,6 @@ func (s *Session) init() error {
 		return ErrNoConnectionsStarted
 	}
 
-	s.skipPrepareStmt = false
-
 	return nil
 }
 
@@ -311,14 +310,6 @@ func (s *Session) SetPrefetch(p float64) {
 func (s *Session) SetTrace(trace Tracer) {
 	s.mu.Lock()
 	s.trace = trace
-	s.mu.Unlock()
-}
-
-// SetSkipPrepStmt sets the default way to execute query(prepare and execute or direct execution).
-// This setting can also be changed on a per-query basis.
-func (s *Session) SetSkipPrepStmt(skip bool) {
-	s.mu.Lock()
-	s.skipPrepareStmt = skip
 	s.mu.Unlock()
 }
 
@@ -692,7 +683,7 @@ type Query struct {
 	disableSkipMetadata   bool
 	context               context.Context
 	idempotent            bool
-	skipPrepareStmt       bool
+	skipPrepStmt       bool
 
 	disableAutoPage bool
 }
@@ -709,7 +700,7 @@ func (q *Query) defaultsFromSession() {
 	q.rt = s.cfg.RetryPolicy
 	q.serialCons = s.cfg.SerialConsistency
 	q.defaultTimestamp = s.cfg.DefaultTimestamp
-	q.skipPrepareStmt = s.skipPrepareStmt
+	q.skipPrepStmt = s.skipPrepStmt
 	q.idempotent = s.cfg.DefaultIdempotence
 	s.mu.RUnlock()
 }
@@ -917,7 +908,7 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 }
 
 func (q *Query) shouldPrepare() bool {
-	if q.skipPrepareStmt {
+	if q.skipPrepStmt {
 		return false
 	}
 	stmt := strings.TrimLeftFunc(strings.TrimRightFunc(q.stmt, func(r rune) bool {
