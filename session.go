@@ -43,7 +43,7 @@ type Session struct {
 	frameObserver       FrameHeaderObserver
 	hostSource          *ringDescriber
 	stmtsLRU            *preparedLRU
-	skipPrepStmt     bool
+	skipPrepStmt        bool
 
 	connCfg *ConnConfig
 
@@ -116,7 +116,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		stmtsLRU:        &preparedLRU{lru: lru.New(cfg.MaxPreparedStmts)},
 		quit:            make(chan struct{}),
 		connectObserver: cfg.ConnectObserver,
-		skipPrepStmt: cfg.SkipPrepStmt,
+		skipPrepStmt:    cfg.SkipPrepStmt,
 	}
 
 	s.schemaDescriber = newSchemaDescriber(s)
@@ -137,8 +137,9 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	s.policy.Init(s)
 
 	s.executor = &queryExecutor{
-		pool:   s.pool,
-		policy: cfg.PoolConfig.HostSelectionPolicy,
+		pool:       s.pool,
+		policy:     cfg.PoolConfig.HostSelectionPolicy,
+		numRetries: cfg.NumExecuteRetries,
 	}
 
 	s.queryObserver = cfg.QueryObserver
@@ -683,7 +684,7 @@ type Query struct {
 	disableSkipMetadata   bool
 	context               context.Context
 	idempotent            bool
-	skipPrepStmt       bool
+	skipPrepStmt          bool
 
 	disableAutoPage bool
 }

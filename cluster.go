@@ -139,6 +139,11 @@ type ClusterConfig struct {
 	// Skip prepared statements
 	SkipPrepStmt bool
 
+	// Number of retry attempts to execute a query on top of other retry policies.
+	// Default value of 0 means there are no retries.
+	// Sleeps for i seconds before retry number i.
+	NumExecuteRetries int
+
 	// internal config for testing
 	disableControlConn bool
 }

@@ -1,6 +1,7 @@
 package gocql
 
 import (
+	"log"
 	"time"
 )
 
@@ -14,8 +15,9 @@ type ExecutableQuery interface {
 }
 
 type queryExecutor struct {
-	pool   *policyConnPool
-	policy HostSelectionPolicy
+	pool       *policyConnPool
+	policy     HostSelectionPolicy
+	numRetries int
 }
 
 func (q *queryExecutor) attemptQuery(qry ExecutableQuery, conn *Conn) *Iter {
@@ -28,7 +30,21 @@ func (q *queryExecutor) attemptQuery(qry ExecutableQuery, conn *Conn) *Iter {
 	return iter
 }
 
-func (q *queryExecutor) executeQuery(qry ExecutableQuery) (*Iter, error) {
+func (q *queryExecutor) executeQuery(qry ExecutableQuery) (iter *Iter, err error) {
+	for i := 0; i <= q.numRetries; i++ {
+		if i > 0 {
+			log.Printf("Retry attempt %d, sleeping for %d seconds.", i, i)
+		}
+		time.Sleep(time.Duration(i) * time.Second)
+		iter, err = q.executeQueryOnce(qry)
+		if err == nil && iter.err == nil {
+			return
+		}
+	}
+	return
+}
+
+func (q *queryExecutor) executeQueryOnce(qry ExecutableQuery) (*Iter, error) {
 	rt := qry.retryPolicy()
 	hostIter := q.policy.Pick(qry)
 
