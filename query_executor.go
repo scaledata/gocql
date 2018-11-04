@@ -33,7 +33,7 @@ func (q *queryExecutor) attemptQuery(qry ExecutableQuery, conn *Conn) *Iter {
 func (q *queryExecutor) executeQuery(qry ExecutableQuery) (iter *Iter, err error) {
 	for i := 0; i <= q.numRetries; i++ {
 		if i > 0 {
-			log.Printf("Execute query error: %v, retry attempt %d, sleeping for %d seconds.", err, i, i)
+			log.Printf("Execute query err: %v, iter.err: %v, retry attempt %d, sleeping for %d seconds.", err, iter.err, i, i)
 		}
 		time.Sleep(time.Duration(i) * time.Second)
 		iter, err = q.executeQueryOnce(qry)
