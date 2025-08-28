@@ -408,3 +408,103 @@ func TestHostPolicy_DCAwareRR(t *testing.T) {
 	}
 
 }
+
+func TestExponentialReconnectionPolicy(t *testing.T) {
+	policy := &ExponentialReconnectionPolicy{
+		MaxRetries:      5,
+		InitialInterval: 100 * time.Millisecond,
+	}
+
+	// Test that MaxRetries is returned correctly
+	if policy.GetMaxRetries() != 5 {
+		t.Fatalf("Expected MaxRetries to be 5, got %d", policy.GetMaxRetries())
+	}
+
+	// Test exponential growth of intervals
+	cases := []struct {
+		currentRetry int
+		minExpected  time.Duration
+		maxExpected  time.Duration
+	}{
+		{0, 0 * time.Millisecond, 100 * time.Millisecond},     // 2^(-1) * 100ms = 50ms with jitter (0-100ms range)
+		{1, 50 * time.Millisecond, 150 * time.Millisecond},    // 2^0 * 100ms = 100ms with jitter (50-150ms range)
+		{2, 150 * time.Millisecond, 250 * time.Millisecond},   // 2^1 * 100ms = 200ms with jitter (150-250ms range)
+		{3, 350 * time.Millisecond, 450 * time.Millisecond},   // 2^2 * 100ms = 400ms with jitter (350-450ms range)
+		{4, 750 * time.Millisecond, 850 * time.Millisecond},   // 2^3 * 100ms = 800ms with jitter (750-850ms range)
+		{5, 1550 * time.Millisecond, 1650 * time.Millisecond}, // 2^4 * 100ms = 1600ms with jitter (1550-1650ms range)
+	}
+
+	for _, c := range cases {
+		// Test multiple times due to jitter
+		for i := 0; i < 10; i++ {
+			interval := policy.GetInterval(c.currentRetry)
+			if interval < c.minExpected || interval > c.maxExpected {
+				t.Errorf("currentRetry=%d: expected interval between %v and %v, got %v",
+					c.currentRetry, c.minExpected, c.maxExpected, interval)
+			}
+		}
+	}
+
+	// Test that intervals increase with retry attempts
+	for retry := 1; retry <= 3; retry++ {
+		// Due to jitter, we can't guarantee strict ordering, but the average should increase
+		// Test multiple times and check that current is generally larger
+		largerCount := 0
+		for i := 0; i < 20; i++ {
+			if policy.GetInterval(retry) > policy.GetInterval(retry-1) {
+				largerCount++
+			}
+		}
+		if largerCount < 10 { // At least half should be larger due to exponential growth
+			t.Errorf("Expected interval for retry %d to generally be larger than retry %d", retry, retry-1)
+		}
+	}
+
+	// Test with different InitialInterval
+	policy2 := &ExponentialReconnectionPolicy{
+		MaxRetries:      3,
+		InitialInterval: 500 * time.Millisecond,
+	}
+
+	interval0 := policy2.GetInterval(0)
+
+	// First interval (retry 0) should be around 0.5 * InitialInterval (with jitter)
+	// 2^(-1) * 500ms = 250ms, with jitter range approximately 125ms to 375ms
+	if interval0 < 125*time.Millisecond || interval0 > 375*time.Millisecond {
+		t.Errorf("Expected first interval around 250ms (0.5 * 500ms), got %v", interval0)
+	}
+
+	// Test that the policy uses currentRetry parameter correctly
+	// by ensuring different retry values produce different results
+	intervals := make(map[int][]time.Duration)
+	for retry := 0; retry < 4; retry++ {
+		for i := 0; i < 5; i++ {
+			intervals[retry] = append(intervals[retry], policy.GetInterval(retry))
+		}
+	}
+
+	// Calculate averages to verify exponential growth despite jitter
+	avgInterval := func(durations []time.Duration) time.Duration {
+		var sum time.Duration
+		for _, d := range durations {
+			sum += d
+		}
+		return sum / time.Duration(len(durations))
+	}
+
+	avg0 := avgInterval(intervals[0])
+	avg1 := avgInterval(intervals[1])
+	avg2 := avgInterval(intervals[2])
+	avg3 := avgInterval(intervals[3])
+
+	// Verify exponential growth pattern (each should be roughly double the previous)
+	if avg1 < avg0 {
+		t.Errorf("Average interval for retry 1 (%v) should be >= retry 0 (%v)", avg1, avg0)
+	}
+	if avg2 < time.Duration(float64(avg1)*1.5) { // Allow some tolerance due to jitter
+		t.Errorf("Average interval for retry 2 (%v) should be significantly larger than retry 1 (%v)", avg2, avg1)
+	}
+	if avg3 < time.Duration(float64(avg2)*1.5) {
+		t.Errorf("Average interval for retry 3 (%v) should be significantly larger than retry 2 (%v)", avg3, avg2)
+	}
+}
