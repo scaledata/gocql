@@ -144,6 +144,19 @@ type ClusterConfig struct {
 	// Sleeps for i seconds before retry number i.
 	NumExecuteRetries int
 
+	// ExecuteRetryInitialDelay is the initial delay before the first retry attempt.
+	// If not set, defaults to 100ms.
+	// Used for exponential backoff calculation.
+	ExecuteRetryInitialDelay time.Duration
+
+	// ExecuteRetryMaxDelay is the maximum delay between retry attempts.
+	// If not set, defaults to 10s.
+	// Used to cap the exponential backoff.
+	ExecuteRetryMaxDelay time.Duration
+
+	// MaxRetryTime is the maximum time to retry a query before returning an error.
+	MaxRetryTime time.Duration
+
 	// internal config for testing
 	disableControlConn bool
 }
@@ -173,7 +186,12 @@ func NewCluster(hosts ...string) *ClusterConfig {
 		MaxWaitSchemaAgreement: 60 * time.Second,
 		ReconnectInterval:      60 * time.Second,
 		ConvictionPolicy:       &SimpleConvictionPolicy{},
-		ReconnectionPolicy:     &ConstantReconnectionPolicy{MaxRetries: 3, Interval: 1 * time.Second},
+		ReconnectionPolicy: &ConstantReconnectionPolicy{
+			MaxRetries: 3,
+			Interval:   1 * time.Second,
+		},
+		ExecuteRetryInitialDelay: 100 * time.Millisecond,
+		ExecuteRetryMaxDelay:     10 * time.Second,
 	}
 	return cfg
 }

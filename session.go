@@ -137,9 +137,12 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	s.policy.Init(s)
 
 	s.executor = &queryExecutor{
-		pool:       s.pool,
-		policy:     cfg.PoolConfig.HostSelectionPolicy,
-		numRetries: cfg.NumExecuteRetries,
+		pool:              s.pool,
+		policy:            cfg.PoolConfig.HostSelectionPolicy,
+		numRetries:        cfg.NumExecuteRetries,
+		retryInitialDelay: cfg.ExecuteRetryInitialDelay,
+		retryMaxDelay:     cfg.ExecuteRetryMaxDelay,
+		maxRetryTime:      cfg.MaxRetryTime,
 	}
 
 	s.queryObserver = cfg.QueryObserver
