@@ -257,13 +257,24 @@ type hostConnPool struct {
 	size     int
 	keyspace string
 	// protection for conns, closed, filling
-	mu      sync.RWMutex
-	conns   []*Conn
-	closed  bool
-	filling bool
+	mu           sync.RWMutex
+	conns        []*Conn
+	expiredConns []*Conn
+	closed       bool
+	filling      bool
 
 	pos uint32
+
+	// drainingMu protects the draining goroutine state
+	drainingMu      sync.Mutex
+	drainingStarted bool
 }
+
+const (
+	// Maximum number of connections that can be in draining state
+	// This prevents opening too many new connections while old ones drain
+	maxDrainingConns = 10
+)
 
 func (h *hostConnPool) String() string {
 	h.mu.RLock()
@@ -276,15 +287,17 @@ func newHostConnPool(session *Session, host *HostInfo, port, size int,
 	keyspace string) *hostConnPool {
 
 	pool := &hostConnPool{
-		session:  session,
-		host:     host,
-		port:     port,
-		addr:     (&net.TCPAddr{IP: host.ConnectAddress(), Port: host.Port()}).String(),
-		size:     size,
-		keyspace: keyspace,
-		conns:    make([]*Conn, 0, size),
-		filling:  false,
-		closed:   false,
+		session:         session,
+		host:            host,
+		port:            port,
+		addr:            (&net.TCPAddr{IP: host.ConnectAddress(), Port: host.Port()}).String(),
+		size:            size,
+		keyspace:        keyspace,
+		conns:           make([]*Conn, 0, size),
+		expiredConns:    make([]*Conn, 0, maxDrainingConns),
+		filling:         false,
+		closed:          false,
+		drainingStarted: false,
 	}
 
 	// the pool is not filled or connected
@@ -294,20 +307,24 @@ func newHostConnPool(session *Session, host *HostInfo, port, size int,
 // Pick a connection from this connection pool for the given query.
 func (pool *hostConnPool) Pick() *Conn {
 	pool.mu.RLock()
-	defer pool.mu.RUnlock()
 
 	if pool.closed {
+		pool.mu.RUnlock()
 		return nil
 	}
 
 	size := len(pool.conns)
 	if size < pool.size {
+		pool.mu.RUnlock()
 		// try to fill the pool
 		go pool.fill()
 
 		if size == 0 {
 			return nil
 		}
+		// Re-acquire read lock after fill
+		pool.mu.RLock()
+		size = len(pool.conns)
 	}
 
 	pos := int(atomic.AddUint32(&pool.pos, 1) - 1)
@@ -315,16 +332,21 @@ func (pool *hostConnPool) Pick() *Conn {
 	var (
 		leastBusyConn    *Conn
 		streamsAvailable int
-		expiredConns     []*Conn
+		expiredIndices   []int
 	)
 
 	// find the conn which has the most available streams, this is racy
 	for i := 0; i < size; i++ {
-		conn := pool.conns[(pos+i)%size]
+		currentPos := (pos + i) % size
+		conn := pool.conns[currentPos]
 
 		// Check if connection has exceeded its max lifetime
 		if conn.IsExpired() {
-			expiredConns = append(expiredConns, conn)
+			// Only mark for expiration if we haven't hit the draining limit
+			// Account for connections we're about to add in this Pick() call
+			if len(pool.expiredConns)+len(expiredIndices) < maxDrainingConns {
+				expiredIndices = append(expiredIndices, currentPos)
+			}
 			continue
 		}
 
@@ -334,19 +356,121 @@ func (pool *hostConnPool) Pick() *Conn {
 		}
 	}
 
-	// Close expired connections asynchronously
-	if len(expiredConns) > 0 {
-		go func() {
-			for _, conn := range expiredConns {
-				conn.Close()
-			}
-		}()
+	// If no expired connections, we can return with just the read lock
+	if len(expiredIndices) == 0 {
+		pool.mu.RUnlock()
+		return leastBusyConn
 	}
 
+	// Need to modify slices, so upgrade to write lock
+	pool.mu.RUnlock()
+	pool.mu.Lock()
+
+	// Re-check conditions after acquiring write lock (state may have changed)
+	if pool.closed {
+		pool.mu.Unlock()
+		return leastBusyConn
+	}
+
+	// Re-validate expired indices (pool.conns may have changed)
+	// and move expired connections from active pool to draining pool
+	validExpiredConns := make([]*Conn, 0, len(expiredIndices))
+	for _, idx := range expiredIndices {
+		if idx < len(pool.conns) {
+			conn := pool.conns[idx]
+			// Re-check if still expired and not already moved
+			if conn.IsExpired() && len(pool.expiredConns) < maxDrainingConns {
+				validExpiredConns = append(validExpiredConns, conn)
+			}
+		}
+	}
+
+	// Remove expired connections from active pool
+	if len(validExpiredConns) > 0 {
+		// Build a set of connections to remove for O(1) lookup
+		toRemove := make(map[*Conn]bool, len(validExpiredConns))
+		for _, conn := range validExpiredConns {
+			toRemove[conn] = true
+			pool.expiredConns = append(pool.expiredConns, conn)
+		}
+
+		// Filter out expired connections from active pool
+		newConns := make([]*Conn, 0, len(pool.conns)-len(validExpiredConns))
+		for _, conn := range pool.conns {
+			if !toRemove[conn] {
+				newConns = append(newConns, conn)
+			}
+		}
+		pool.conns = newConns
+
+		// Start the draining goroutine if not already running
+		pool.startDrainingGoroutine()
+	}
+
+	pool.mu.Unlock()
 	return leastBusyConn
 }
 
-//Size returns the number of connections currently active in the pool
+// startDrainingGoroutine starts a background goroutine to close expired connections
+// once they have no active streams. Must be called with pool.mu held.
+func (pool *hostConnPool) startDrainingGoroutine() {
+	pool.drainingMu.Lock()
+	defer pool.drainingMu.Unlock()
+
+	if pool.drainingStarted {
+		return
+	}
+
+	pool.drainingStarted = true
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			<-ticker.C
+
+			pool.mu.Lock()
+
+			if pool.closed {
+				pool.mu.Unlock()
+				pool.drainingMu.Lock()
+				pool.drainingStarted = false
+				pool.drainingMu.Unlock()
+				return
+			}
+
+			// Check each expired connection
+			remaining := make([]*Conn, 0, len(pool.expiredConns))
+			for _, conn := range pool.expiredConns {
+				// Check if all streams are available (meaning none are in use)
+				// NumStreams - 1 accounts for the reserved stream 0
+				if conn.AvailableStreams() >= conn.streams.NumStreams-1 {
+					// All streams are free, safe to close
+					conn.Close()
+				} else {
+					// Still has active streams, keep draining
+					remaining = append(remaining, conn)
+				}
+			}
+
+			pool.expiredConns = remaining
+
+			// If no more expired connections, stop the goroutine
+			if len(pool.expiredConns) == 0 {
+				pool.mu.Unlock()
+				pool.drainingMu.Lock()
+				pool.drainingStarted = false
+				pool.drainingMu.Unlock()
+				return
+			}
+
+			pool.mu.Unlock()
+		}
+	}()
+}
+
+// Size returns the number of connections currently active in the pool
 func (pool *hostConnPool) Size() int {
 	pool.mu.RLock()
 	defer pool.mu.RUnlock()
@@ -354,7 +478,7 @@ func (pool *hostConnPool) Size() int {
 	return len(pool.conns)
 }
 
-//Close the connection pool
+// Close the connection pool
 func (pool *hostConnPool) Close() {
 	pool.mu.Lock()
 
@@ -377,10 +501,19 @@ func (pool *hostConnPool) Close() {
 	conns := pool.conns
 	pool.conns = nil
 
+	// Also close any draining connections
+	expiredConns := pool.expiredConns
+	pool.expiredConns = nil
+
 	pool.mu.Unlock()
 
-	// close the connections
+	// close the active connections
 	for _, conn := range conns {
+		conn.Close()
+	}
+
+	// close the draining connections
+	for _, conn := range expiredConns {
 		conn.Close()
 	}
 }
