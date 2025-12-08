@@ -279,16 +279,12 @@ const (
 func (h *hostConnPool) String() string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return fmt.Sprintf(
-		"[filling=%v closed=%v conns=%v size=%v host=%v]",
-		h.filling, h.closed, len(h.conns), h.size, h.host,
-	)
+	return fmt.Sprintf("[filling=%v closed=%v conns=%v size=%v host=%v]",
+		h.filling, h.closed, len(h.conns), h.size, h.host)
 }
 
-func newHostConnPool(
-	session *Session, host *HostInfo, port, size int,
-	keyspace string,
-) *hostConnPool {
+func newHostConnPool(session *Session, host *HostInfo, port, size int,
+	keyspace string) *hostConnPool {
 
 	pool := &hostConnPool{
 		session: session,
@@ -322,6 +318,8 @@ func (pool *hostConnPool) Pick() *Conn {
 
 	size := len(pool.conns)
 	if size == 0 {
+		// this will create one connection synchronously and fill the pool
+		// asynchronously
 		pool.fill()
 	} else if size < pool.size {
 		// try to fill the pool
