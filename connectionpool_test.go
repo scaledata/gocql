@@ -116,6 +116,8 @@ func TestConnectionExpiration_ActiveQueries(t *testing.T) {
 	}
 
 	pool := newHostConnPool(session, host, 9042, 5, "")
+	// Set fast ticker for testing
+	pool.maintenanceTicker = 100 * time.Millisecond
 
 	// Create an expired connection with active streams
 	now := time.Now()
@@ -129,12 +131,8 @@ func TestConnectionExpiration_ActiveQueries(t *testing.T) {
 	pool.conns = []*Conn{expiredConn}
 	pool.mu.Unlock()
 
-	// Pick will start maintenance goroutine
-	// It may return the expired connection (expiration is handled asynchronously)
-	_ = pool.Pick()
-
 	// Wait for maintenance goroutine to move it to draining and check it
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	pool.mu.Lock()
 	// Connection should still be in draining pool (not closed)
@@ -148,7 +146,7 @@ func TestConnectionExpiration_ActiveQueries(t *testing.T) {
 	expiredConn.streams.Clear(stream2)
 
 	// Wait for maintenance goroutine to close it
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
@@ -183,12 +181,8 @@ func TestConnectionExpiration_DrainingLimit(t *testing.T) {
 	}
 	pool.mu.Unlock()
 
-	// Pick a connection - will start maintenance goroutine
-	// May return an expired connection (expiration is handled asynchronously)
-	_ = pool.Pick()
-
 	// Wait for maintenance goroutine to move connections to draining
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	pool.mu.Lock()
 	drainingCount := len(pool.expiredConns)
@@ -310,52 +304,6 @@ func TestConnectionExpiration_PoolClose(t *testing.T) {
 	}
 }
 
-// TestConnectionExpiration_DrainingGoroutineStops tests that draining goroutine exits when done
-func TestConnectionExpiration_DrainingGoroutineStops(t *testing.T) {
-	session := createTestSession()
-	host := &HostInfo{
-		connectAddress: net.IPv4(127, 0, 0, 1),
-		port:           9042,
-	}
-
-	pool := newHostConnPool(session, host, 9042, 5, "")
-
-	// Add an expired connection
-	now := time.Now()
-	expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
-
-	pool.mu.Lock()
-	pool.conns = []*Conn{expiredConn}
-	pool.mu.Unlock()
-
-	// Pick to start maintenance
-	pool.Pick()
-
-	// Give goroutine time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Maintenance should have started
-	pool.maintenanceMu.Lock()
-	if !pool.maintenanceStarted {
-		t.Errorf("Expected maintenance goroutine to be started")
-	}
-	pool.maintenanceMu.Unlock()
-
-	// Wait for connection to be drained (all streams are free by default)
-	time.Sleep(1500 * time.Millisecond)
-
-	// Maintenance goroutine should have stopped
-	pool.maintenanceMu.Lock()
-	defer pool.maintenanceMu.Unlock()
-
-	if pool.maintenanceStarted {
-		t.Errorf("Expected maintenance goroutine to have stopped")
-	}
-}
-
-
-
-
 // TestConnectionExpiration_NoExpirationWhenDisabled tests that connections don't expire when ConnMaxLifetime is 0
 func TestConnectionExpiration_NoExpirationWhenDisabled(t *testing.T) {
 	session := createTestSession()
@@ -454,6 +402,8 @@ func TestConnectionExpiration_MultiplePickCycles(t *testing.T) {
 	}
 
 	pool := newHostConnPool(session, host, 9042, 10, "")
+	// Set fast ticker for testing
+	pool.maintenanceTicker = 100 * time.Millisecond
 
 	// Add fresh connections
 	now := time.Now()
@@ -492,7 +442,7 @@ func TestConnectionExpiration_MultiplePickCycles(t *testing.T) {
 	}
 
 	// Wait for maintenance to move expired connections
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
@@ -614,53 +564,9 @@ func TestConnectionExpiration_DrainingGoroutineRestart(t *testing.T) {
 
 	pool := newHostConnPool(session, host, 9042, 5, "")
 
-	// First batch of expired connections
-	now := time.Now()
-	expiredConn1 := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
-
-	pool.mu.Lock()
-	pool.conns = []*Conn{expiredConn1}
-	pool.mu.Unlock()
-
-	// Pick to start draining
-	pool.Pick()
-
-	// Wait for maintenance to complete
-	time.Sleep(1500 * time.Millisecond)
-
-	pool.maintenanceMu.Lock()
-	if pool.maintenanceStarted {
-		t.Errorf("Expected maintenance goroutine to have stopped after first batch")
-	}
-	pool.maintenanceMu.Unlock()
-
-	// Add another expired connection
-	expiredConn2 := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
-
-	pool.mu.Lock()
-	pool.conns = []*Conn{expiredConn2}
-	pool.mu.Unlock()
-
-	// Pick again to restart maintenance
-	pool.Pick()
-
-	// Give goroutine time to start
-	time.Sleep(100 * time.Millisecond)
-
 	pool.maintenanceMu.Lock()
 	if !pool.maintenanceStarted {
-		t.Errorf("Expected maintenance goroutine to restart for second batch")
-	}
-	pool.maintenanceMu.Unlock()
-
-	// Wait for maintenance to complete again
-	time.Sleep(1500 * time.Millisecond)
-
-	pool.maintenanceMu.Lock()
-	defer pool.maintenanceMu.Unlock()
-
-	if pool.maintenanceStarted {
-		t.Errorf("Expected maintenance goroutine to have stopped after second batch")
+		t.Error("Expected maintenance to be started")
 	}
 }
 
@@ -682,12 +588,6 @@ func TestConnectionExpiration_ClosedPoolStopsDraining(t *testing.T) {
 	pool.mu.Lock()
 	pool.conns = []*Conn{expiredConn}
 	pool.mu.Unlock()
-
-	// Pick to start maintenance
-	pool.Pick()
-
-	// Give goroutine time to start
-	time.Sleep(100 * time.Millisecond)
 
 	// Verify maintenance started
 	pool.maintenanceMu.Lock()
@@ -764,6 +664,60 @@ func BenchmarkPickWithExpiration(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		pool.Pick()
+	}
+}
+
+// TestMaintenanceGoroutine_ConfigurableInterval demonstrates using a custom ticker interval for testing
+func TestMaintenanceGoroutine_ConfigurableInterval(t *testing.T) {
+	session := createTestSession()
+	host := &HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 1),
+		port:           9042,
+	}
+
+	// Create pool but don't start maintenance goroutine yet
+	pool := &hostConnPool{
+		session:            session,
+		host:               host,
+		port:               9042,
+		size:               5,
+		conns:              make([]*Conn, 0, 5),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  100 * time.Millisecond, // Fast ticker for testing (100ms instead of 30s)
+	}
+
+	// Add an expired connection
+	now := time.Now()
+	expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+
+	pool.mu.Lock()
+	pool.conns = []*Conn{expiredConn}
+	pool.mu.Unlock()
+
+	// Now start the maintenance goroutine with the fast ticker
+	pool.startMaintenanceGoroutine()
+
+	// Wait for the fast ticker to run (much shorter than 30s!)
+	// First run is immediate, then wait for one more tick to ensure it processes
+	time.Sleep(200 * time.Millisecond)
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	// Expired connection should be closed
+	if !expiredConn.Closed() {
+		t.Errorf("Expected expired connection to be closed")
+	}
+
+	// Active pool should be empty
+	if len(pool.conns) != 0 {
+		t.Errorf(
+			"Expected 0 connections in active pool, got %d",
+			len(pool.conns),
+		)
 	}
 }
 

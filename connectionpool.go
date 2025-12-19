@@ -268,12 +268,16 @@ type hostConnPool struct {
 	// maintenanceMu protects the maintenance goroutine state
 	maintenanceMu      sync.Mutex
 	maintenanceStarted bool
+	maintenanceTicker time.Duration
 }
 
 const (
 	// Maximum number of connections that can be in draining state
 	// This prevents opening too many new connections while old ones drain
 	maxDrainingConns = 10
+
+	// Default interval for maintenance goroutine to check for expired connections
+	defaultMaintenanceInterval = 30 * time.Second
 )
 
 func (h *hostConnPool) String() string {
@@ -301,7 +305,12 @@ func newHostConnPool(session *Session, host *HostInfo, port, size int,
 		filling:            false,
 		closed:             false,
 		maintenanceStarted: false,
+		maintenanceTicker: defaultMaintenanceInterval,
 	}
+
+	// Start maintenance goroutine
+	// This handles expiration checking in the background
+	pool.startMaintenanceGoroutine()
 
 	// the pool is not filled or connected
 	return pool
@@ -365,15 +374,16 @@ func (pool *hostConnPool) startMaintenanceGoroutine() {
 	pool.maintenanceStarted = true
 
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(pool.maintenanceTicker)
 		defer ticker.Stop()
 
 		// Perform an immediate check, then continue with periodic checks
 		for {
-			pool.mu.Lock()
+			// Perform maintenance work
+			pool.mu.RLock()
 
 			if pool.closed {
-				pool.mu.Unlock()
+				pool.mu.RUnlock()
 				pool.maintenanceMu.Lock()
 				pool.maintenanceStarted = false
 				pool.maintenanceMu.Unlock()
@@ -400,9 +410,14 @@ func (pool *hostConnPool) startMaintenanceGoroutine() {
 				}
 			}
 
+			pool.mu.RUnlock()
+
 			// Update the active connection pool
 			if len(expiredConns) > 0 {
+				pool.mu.Lock()
 				pool.conns = activeConns
+				pool.mu.Unlock()
+
 				pool.expiredConns = append(pool.expiredConns, expiredConns...)
 			}
 
@@ -421,17 +436,6 @@ func (pool *hostConnPool) startMaintenanceGoroutine() {
 			}
 
 			pool.expiredConns = remaining
-
-			// If no more expired connections and no active connections to check, stop the goroutine
-			if len(pool.expiredConns) == 0 && len(expiredConns) == 0 {
-				pool.mu.Unlock()
-				pool.maintenanceMu.Lock()
-				pool.maintenanceStarted = false
-				pool.maintenanceMu.Unlock()
-				return
-			}
-
-			pool.mu.Unlock()
 
 			// Wait for next tick
 			<-ticker.C
