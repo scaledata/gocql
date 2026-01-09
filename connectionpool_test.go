@@ -350,11 +350,16 @@ func TestConnectionExpiration_DrainingLimit(t *testing.T) {
 	}
 
 	// Should have at least some connections remaining in active pool
-	if activeCount == 0 && numExpired > maxDrainingConns {
+	if activeCount == 0 {
 		t.Errorf(
 			"Expected some connections remaining in active pool " +
 				"when total > maxDrainingConns",
 		)
+	}
+
+	// Should have some draining connections
+	if drainingCount == 0 {
+		t.Errorf("Expected some connections remaining in draining pool")
 	}
 }
 
