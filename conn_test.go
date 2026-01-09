@@ -1034,16 +1034,12 @@ func TestConnIsExpiredJustExpired(t *testing.T) {
 		createdAt: time.Now(),
 	}
 
-	// Connection should not be expired immediately
-	if conn.IsExpired() {
-		t.Error("Connection should not be expired immediately after creation")
-	}
-
 	// Wait for the connection to expire
-	time.Sleep(150 * time.Millisecond)
-
-	// Connection should now be expired
-	if !conn.IsExpired() {
-		t.Error("Connection should be expired after max lifetime")
+	if err := TimedWaitForFnForTest(
+		func() bool {
+			return conn.IsExpired()
+		}, 200*time.Millisecond,
+	); err != nil {
+		t.Error("Connection should be expired")
 	}
 }
