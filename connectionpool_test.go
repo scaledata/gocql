@@ -51,6 +51,35 @@ func mockConn(protocol int, createdAt time.Time, maxLifetime time.Duration) *Con
 	}
 }
 
+// getExpiredConnsCount returns the number of connections in the draining pool
+// This helper ensures proper locking with maintenanceMu
+func getExpiredConnsCount(pool *hostConnPool) int {
+	pool.maintenanceMu.Lock()
+	defer pool.maintenanceMu.Unlock()
+	return len(pool.expiredConns)
+}
+
+// getExpiredConns returns a copy of the expired connections slice
+// This helper ensures proper locking with maintenanceMu
+func getExpiredConns(pool *hostConnPool) []*Conn {
+	pool.maintenanceMu.Lock()
+	defer pool.maintenanceMu.Unlock()
+	if pool.expiredConns == nil {
+		return nil
+	}
+	conns := make([]*Conn, len(pool.expiredConns))
+	copy(conns, pool.expiredConns)
+	return conns
+}
+
+// setExpiredConns sets the expired connections slice
+// This helper ensures proper locking with maintenanceMu
+func setExpiredConns(pool *hostConnPool, conns []*Conn) {
+	pool.maintenanceMu.Lock()
+	defer pool.maintenanceMu.Unlock()
+	pool.expiredConns = conns
+}
+
 // TestConnectionExpiration_BasicExpiration tests that expired connections are moved to draining pool
 // and closed when they have no active streams
 func TestConnectionExpiration_BasicExpiration(t *testing.T) {
@@ -113,14 +142,17 @@ func TestConnectionExpiration_BasicExpiration(t *testing.T) {
 	}
 
 	pool.mu.Lock()
-	defer pool.mu.Unlock()
+	activeCount := len(pool.conns)
+	pool.mu.Unlock()
 
-	t.Logf("Active connections: %d, Draining connections: %d", len(pool.conns), len(pool.expiredConns))
+	drainingCount := getExpiredConnsCount(pool)
+
+	t.Logf("Active connections: %d, Draining connections: %d", activeCount, drainingCount)
 	t.Logf("Expired conn closed: %v", expiredConn.Closed())
 
 	// Expired connection should be removed from active pool
-	if len(pool.conns) != 1 {
-		t.Errorf("Expected 1 connection in active pool, got %d", len(pool.conns))
+	if activeCount != 1 {
+		t.Errorf("Expected 1 connection in active pool, got %d", activeCount)
 	}
 
 	// Expired connection should have been moved to draining and then closed
@@ -130,8 +162,8 @@ func TestConnectionExpiration_BasicExpiration(t *testing.T) {
 	}
 
 	// The draining pool should be empty since the connection was closed immediately
-	if len(pool.expiredConns) != 0 {
-		t.Errorf("Expected 0 connections in draining pool (closed immediately), got %d", len(pool.expiredConns))
+	if drainingCount != 0 {
+		t.Errorf("Expected 0 connections in draining pool (closed immediately), got %d", drainingCount)
 	}
 }
 
@@ -180,9 +212,7 @@ func TestConnectionExpiration_ActiveQueries(t *testing.T) {
 	// The goroutine runs immediately on start, then waits for ticker
 	if err := TimedWaitForFnForTest(
 		func() bool {
-			pool.mu.Lock()
-			defer pool.mu.Unlock()
-			return len(pool.expiredConns) == 1
+			return getExpiredConnsCount(pool) == 1
 		}, 150*time.Millisecond,
 	); err != nil {
 		t.Fatalf(
@@ -191,12 +221,10 @@ func TestConnectionExpiration_ActiveQueries(t *testing.T) {
 		)
 	}
 
-	pool.mu.Lock()
 	// Connection should still be in draining pool (not closed due to active streams)
-	if len(pool.expiredConns) != 1 {
-		t.Errorf("Expected connection to still be draining, got %d connections", len(pool.expiredConns))
+	if getExpiredConnsCount(pool) != 1 {
+		t.Errorf("Expected connection to still be draining, got %d connections", getExpiredConnsCount(pool))
 	}
-	pool.mu.Unlock()
 
 	// Release streams
 	expiredConn.streams.Clear(stream1)
@@ -205,20 +233,15 @@ func TestConnectionExpiration_ActiveQueries(t *testing.T) {
 	// Wait for next maintenance cycle to close it
 	if err := TimedWaitForFnForTest(
 		func() bool {
-			pool.mu.Lock()
-			defer pool.mu.Unlock()
-			return len(pool.expiredConns) == 0
+			return getExpiredConnsCount(pool) == 0
 		}, 150*time.Millisecond,
 	); err != nil {
 		t.Fatalf("Timed out waiting for connection to be closed: %v", err)
 	}
 
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
 	// Now it should be closed and removed from draining pool
-	if len(pool.expiredConns) != 0 {
-		t.Errorf("Expected connection to be closed and removed, got %d connections", len(pool.expiredConns))
+	if getExpiredConnsCount(pool) != 0 {
+		t.Errorf("Expected connection to be closed and removed, got %d connections", getExpiredConnsCount(pool))
 	}
 }
 
@@ -269,9 +292,7 @@ func TestConnectionExpiration_DrainingLimit(t *testing.T) {
 	// The goroutine runs immediately on start, then waits for ticker
 	if err := TimedWaitForFnForTest(
 		func() bool {
-			pool.mu.Lock()
-			defer pool.mu.Unlock()
-			return len(pool.expiredConns) > 0
+			return getExpiredConnsCount(pool) > 0
 		}, 150*time.Millisecond,
 	); err != nil {
 		t.Fatalf(
@@ -280,8 +301,8 @@ func TestConnectionExpiration_DrainingLimit(t *testing.T) {
 		)
 	}
 
+	drainingCount := getExpiredConnsCount(pool)
 	pool.mu.Lock()
-	drainingCount := len(pool.expiredConns)
 	activeCount := len(pool.conns)
 	pool.mu.Unlock()
 
@@ -364,9 +385,7 @@ func TestConnectionExpiration_ConcurrentPick(t *testing.T) {
 	// The goroutine runs immediately on start, then waits for ticker
 	if err := TimedWaitForFnForTest(
 		func() bool {
-			pool.mu.Lock()
-			defer pool.mu.Unlock()
-			return len(pool.expiredConns) == 5
+			return getExpiredConnsCount(pool) == 5
 		}, 150*time.Millisecond,
 	); err != nil {
 		t.Fatalf(
@@ -375,18 +394,17 @@ func TestConnectionExpiration_ConcurrentPick(t *testing.T) {
 		)
 	}
 
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
 	// All expired connections should be moved to draining (not closed due to active streams)
-	if len(pool.expiredConns) != 5 {
-		t.Errorf("Expected 5 connections in draining pool, got %d", len(pool.expiredConns))
+	if getExpiredConnsCount(pool) != 5 {
+		t.Errorf("Expected 5 connections in draining pool, got %d", getExpiredConnsCount(pool))
 	}
 
+	pool.mu.Lock()
 	// Only fresh connections should remain
 	if len(pool.conns) != 5 {
 		t.Errorf("Expected 5 connections in active pool, got %d", len(pool.conns))
 	}
+	pool.mu.Unlock()
 }
 
 // TestConnectionExpiration_PoolClose tests that closing the pool closes all connections
@@ -406,26 +424,28 @@ func TestConnectionExpiration_PoolClose(t *testing.T) {
 
 	pool.mu.Lock()
 	pool.conns = []*Conn{activeConn}
-	pool.expiredConns = []*Conn{drainingConn}
 	pool.mu.Unlock()
+
+	setExpiredConns(pool, []*Conn{drainingConn})
 
 	// Close the pool
 	pool.Close()
 
 	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
 	// Both pools should be empty
 	if pool.conns != nil {
 		t.Errorf("Expected active pool to be nil after close")
 	}
+	closed := pool.closed
+	pool.mu.Unlock()
 
-	if pool.expiredConns != nil {
+	expiredConns := getExpiredConns(pool)
+	if expiredConns != nil {
 		t.Errorf("Expected draining pool to be nil after close")
 	}
 
 	// Pool should be marked as closed
-	if !pool.closed {
+	if !closed {
 		t.Errorf("Expected pool to be marked as closed")
 	}
 }
@@ -460,8 +480,8 @@ func TestConnectionExpiration_NoExpirationWhenDisabled(t *testing.T) {
 	}
 
 	// No connections should be in draining pool
-	if len(pool.expiredConns) != 0 {
-		t.Errorf("Expected 0 connections in draining pool, got %d", len(pool.expiredConns))
+	if getExpiredConnsCount(pool) != 0 {
+		t.Errorf("Expected 0 connections in draining pool, got %d", getExpiredConnsCount(pool))
 	}
 
 	// Connection should still be in active pool
@@ -530,8 +550,8 @@ func TestConnectionExpiration_PoolRefill(t *testing.T) {
 
 	pool.mu.Lock()
 	activeCount := len(pool.conns)
-	drainingCount := len(pool.expiredConns)
 	pool.mu.Unlock()
+	drainingCount := getExpiredConnsCount(pool)
 
 	// Active pool should be empty now (all moved to draining)
 	if activeCount != 0 {
@@ -590,11 +610,9 @@ func TestConnectionExpiration_MultiplePickCycles(t *testing.T) {
 		t.Errorf("Expected to get a connection")
 	}
 
-	pool.mu.Lock()
-	if len(pool.expiredConns) != 0 {
+	if getExpiredConnsCount(pool) != 0 {
 		t.Errorf("Expected no expired connections yet")
 	}
-	pool.mu.Unlock()
 
 	// Manually expire some connections by changing their createdAt time
 	pool.mu.Lock()
@@ -609,9 +627,7 @@ func TestConnectionExpiration_MultiplePickCycles(t *testing.T) {
 	// The goroutine runs immediately on start, then waits for ticker
 	if err := TimedWaitForFnForTest(
 		func() bool {
-			pool.mu.Lock()
-			defer pool.mu.Unlock()
-			return len(pool.expiredConns) == 2
+			return getExpiredConnsCount(pool) == 2
 		}, 150*time.Millisecond,
 	); err != nil {
 		t.Fatalf(
@@ -620,16 +636,15 @@ func TestConnectionExpiration_MultiplePickCycles(t *testing.T) {
 		)
 	}
 
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
-	if len(pool.expiredConns) != 2 {
-		t.Errorf("Expected 2 expired connections, got %d", len(pool.expiredConns))
+	if getExpiredConnsCount(pool) != 2 {
+		t.Errorf("Expected 2 expired connections, got %d", getExpiredConnsCount(pool))
 	}
 
+	pool.mu.Lock()
 	if len(pool.conns) != 3 {
 		t.Errorf("Expected 3 active connections, got %d", len(pool.conns))
 	}
+	pool.mu.Unlock()
 }
 
 // TestConnectionExpiration_StreamAvailabilityCheck tests the correct stream availability calculation
@@ -926,10 +941,11 @@ func TestMaintenanceGoroutine_ConfigurableInterval(t *testing.T) {
 	if err := TimedWaitForFnForTest(
 		func() bool {
 			pool.mu.Lock()
-			defer pool.mu.Unlock()
+			activeCount := len(pool.conns)
+			pool.mu.Unlock()
 			return expiredConn.Closed() &&
-				len(pool.conns) == 0 &&
-				len(pool.expiredConns) == 0
+				activeCount == 0 &&
+				getExpiredConnsCount(pool) == 0
 		}, 500*time.Millisecond,
 	); err != nil {
 		t.Errorf(
