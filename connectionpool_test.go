@@ -16,43 +16,43 @@ import (
 	"github.com/gocql/gocql/internal/streams"
 )
 
-// mockNetConn is a mock net.Conn for testing
-type mockNetConn struct {
+// fakeNetConn is a fake net.Conn for testing
+type fakeNetConn struct {
 	net.Conn
 	closed bool
 }
 
-func (m *mockNetConn) Close() error {
+func (m *fakeNetConn) Close() error {
 	m.closed = true
 	return nil
 }
 
-func (m *mockNetConn) RemoteAddr() net.Addr {
+func (m *fakeNetConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9042}
 }
 
-// mockErrorHandler is a no-op error handler for testing
-type mockErrorHandler struct{}
+// fakeErrorHandler is a no-op error handler for testing
+type fakeErrorHandler struct{}
 
-func (m *mockErrorHandler) HandleError(conn *Conn, err error, closed bool) {
+func (m *fakeErrorHandler) HandleError(conn *Conn, err error, closed bool) {
 	// No-op for testing
 }
 
-// mockConn creates a mock connection for testing
-func mockConn(
+// fakeConn creates a fake connection for testing
+func fakeConn(
 	protocol int,
 	createdAt time.Time,
 	maxLifetime time.Duration,
 ) *Conn {
 	return &Conn{
-		conn:         &mockNetConn{},
+		conn:         &fakeNetConn{},
 		streams:      streams.New(protocol),
 		cfg:          &ConnConfig{ConnMaxLifetime: maxLifetime},
 		createdAt:    createdAt,
 		closed:       0,
 		calls:        make(map[int]*callReq),
 		quit:         make(chan struct{}),
-		errorHandler: &mockErrorHandler{},
+		errorHandler: &fakeErrorHandler{},
 	}
 }
 
@@ -114,8 +114,8 @@ func TestConnectionExpiration_BasicExpiration(t *testing.T) {
 
 	// Add connections with different ages
 	now := time.Now()
-	expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
-	freshConn := mockConn(3, now.Add(-30*time.Minute), 1*time.Hour)
+	expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+	freshConn := fakeConn(3, now.Add(-30*time.Minute), 1*time.Hour)
 
 	// Verify expiration check works
 	if !expiredConn.IsExpired() {
@@ -209,7 +209,7 @@ func TestConnectionExpiration_ActiveQueries(t *testing.T) {
 
 	// Create an expired connection with active streams
 	now := time.Now()
-	expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+	expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 
 	// Simulate active streams by allocating some
 	stream1, _ := expiredConn.streams.GetStream()
@@ -302,7 +302,7 @@ func TestConnectionExpiration_DrainingLimit(t *testing.T) {
 
 	pool.mu.Lock()
 	for i := 0; i < numExpired; i++ {
-		expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+		expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 		// Allocate a stream so the connection won't be closed immediately
 		// by maintenance goroutine
 		expiredConn.streams.GetStream()
@@ -389,14 +389,14 @@ func TestConnectionExpiration_ConcurrentPick(t *testing.T) {
 	var expiredConns []*Conn
 	pool.mu.Lock()
 	for i := 0; i < 5; i++ {
-		expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+		expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 		// Allocate a stream so they won't be closed immediately
 		expiredConn.streams.GetStream()
 		expiredConns = append(expiredConns, expiredConn)
 		pool.conns = append(pool.conns, expiredConn)
 	}
 	for i := 0; i < 5; i++ {
-		freshConn := mockConn(3, now.Add(-30*time.Minute), 1*time.Hour)
+		freshConn := fakeConn(3, now.Add(-30*time.Minute), 1*time.Hour)
 		pool.conns = append(pool.conns, freshConn)
 	}
 	pool.mu.Unlock()
@@ -462,8 +462,8 @@ func TestConnectionExpiration_PoolClose(t *testing.T) {
 
 	// Add connections to both active and draining pools
 	now := time.Now()
-	activeConn := mockConn(3, now.Add(-30*time.Minute), 1*time.Hour)
-	drainingConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+	activeConn := fakeConn(3, now.Add(-30*time.Minute), 1*time.Hour)
+	drainingConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 
 	pool.mu.Lock()
 	pool.conns = []*Conn{activeConn}
@@ -506,7 +506,7 @@ func TestConnectionExpiration_NoExpirationWhenDisabled(t *testing.T) {
 
 	// Create old connection but with ConnMaxLifetime disabled (0)
 	now := time.Now()
-	oldConn := mockConn(
+	oldConn := fakeConn(
 		3,
 		now.Add(-24*time.Hour),
 		0,
@@ -578,7 +578,7 @@ func TestConnectionExpiration_PoolRefill(t *testing.T) {
 	now := time.Now()
 	pool.mu.Lock()
 	for i := 0; i < poolSize; i++ {
-		expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+		expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 		// Allocate a stream so they won't be closed immediately
 		expiredConn.streams.GetStream()
 		pool.conns = append(pool.conns, expiredConn)
@@ -659,7 +659,7 @@ func TestConnectionExpiration_MultiplePickCycles(t *testing.T) {
 	now := time.Now()
 	pool.mu.Lock()
 	for i := 0; i < 5; i++ {
-		freshConn := mockConn(3, now.Add(-30*time.Minute), 1*time.Hour)
+		freshConn := fakeConn(3, now.Add(-30*time.Minute), 1*time.Hour)
 		pool.conns = append(pool.conns, freshConn)
 	}
 	pool.mu.Unlock()
@@ -717,7 +717,7 @@ func TestConnectionExpiration_MultiplePickCycles(t *testing.T) {
 // availability calculation
 func TestConnectionExpiration_StreamAvailabilityCheck(t *testing.T) {
 	// Test for protocol v3 (32768 streams)
-	conn := mockConn(3, time.Now().Add(-2*time.Hour), 1*time.Hour)
+	conn := fakeConn(3, time.Now().Add(-2*time.Hour), 1*time.Hour)
 
 	// All streams should be available initially (minus reserved stream 0)
 	available := conn.AvailableStreams()
@@ -776,9 +776,9 @@ func TestConnectionExpiration_RaceCondition(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		var conn *Conn
 		if i%2 == 0 {
-			conn = mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+			conn = fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 		} else {
-			conn = mockConn(3, now.Add(-30*time.Minute), 1*time.Hour)
+			conn = fakeConn(3, now.Add(-30*time.Minute), 1*time.Hour)
 		}
 		pool.conns = append(pool.conns, conn)
 	}
@@ -877,7 +877,7 @@ func TestConnectionExpiration_ClosedPoolStopsDraining(t *testing.T) {
 
 	// Add expired connection with active streams
 	now := time.Now()
-	expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+	expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 	// Allocate a stream so it won't close immediately
 	expiredConn.streams.GetStream()
 
@@ -932,7 +932,7 @@ func BenchmarkPick(b *testing.B) {
 	now := time.Now()
 	pool.mu.Lock()
 	for i := 0; i < 10; i++ {
-		freshConn := mockConn(3, now.Add(-30*time.Minute), 1*time.Hour)
+		freshConn := fakeConn(3, now.Add(-30*time.Minute), 1*time.Hour)
 		pool.conns = append(pool.conns, freshConn)
 	}
 	pool.mu.Unlock()
@@ -961,11 +961,11 @@ func BenchmarkPickWithExpiration(b *testing.B) {
 	now := time.Now()
 	pool.mu.Lock()
 	for i := 0; i < 7; i++ {
-		freshConn := mockConn(3, now.Add(-30*time.Minute), 1*time.Hour)
+		freshConn := fakeConn(3, now.Add(-30*time.Minute), 1*time.Hour)
 		pool.conns = append(pool.conns, freshConn)
 	}
 	for i := 0; i < 3; i++ {
-		expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+		expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 		pool.conns = append(pool.conns, expiredConn)
 	}
 	pool.mu.Unlock()
@@ -1009,7 +1009,7 @@ func TestMaintenanceGoroutine_ConfigurableInterval(t *testing.T) {
 
 	// Add an expired connection
 	now := time.Now()
-	expiredConn := mockConn(3, now.Add(-2*time.Hour), 1*time.Hour)
+	expiredConn := fakeConn(3, now.Add(-2*time.Hour), 1*time.Hour)
 
 	pool.mu.Lock()
 	pool.conns = []*Conn{expiredConn}
