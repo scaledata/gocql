@@ -40,7 +40,10 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 
 		pem, err := ioutil.ReadFile(sslOpts.CaPath)
 		if err != nil {
-			return nil, fmt.Errorf("connectionpool: unable to open CA certs: %v", err)
+			return nil, fmt.Errorf(
+				"connectionpool: unable to open CA certs: %v",
+				err,
+			)
 		}
 
 		if !sslOpts.RootCAs.AppendCertsFromPEM(pem) {
@@ -51,7 +54,10 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 	if sslOpts.CertPath != "" || sslOpts.KeyPath != "" {
 		mycert, err := tls.LoadX509KeyPair(sslOpts.CertPath, sslOpts.KeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("connectionpool: unable to load X509 key pair: %v", err)
+			return nil, fmt.Errorf(
+				"connectionpool: unable to load X509 key pair: %v",
+				err,
+			)
 		}
 		sslOpts.Certificates = append(sslOpts.Certificates, mycert)
 	}
@@ -268,9 +274,9 @@ type hostConnPool struct {
 	// maintenanceMu protects expiredConns and maintenance goroutine state
 	// Used only by maintenance goroutine and Close() - separate from hot path
 	maintenanceMu      sync.Mutex
-	expiredConns      []*Conn
+	expiredConns       []*Conn
 	maintenanceStarted bool
-	maintenanceTicker time.Duration
+	maintenanceTicker  time.Duration
 }
 
 const (
@@ -285,12 +291,16 @@ const (
 func (h *hostConnPool) String() string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return fmt.Sprintf("[filling=%v closed=%v conns=%v size=%v host=%v]",
-		h.filling, h.closed, len(h.conns), h.size, h.host)
+	return fmt.Sprintf(
+		"[filling=%v closed=%v conns=%v size=%v host=%v]",
+		h.filling, h.closed, len(h.conns), h.size, h.host,
+	)
 }
 
-func newHostConnPool(session *Session, host *HostInfo, port, size int,
-	keyspace string) *hostConnPool {
+func newHostConnPool(
+	session *Session, host *HostInfo, port, size int,
+	keyspace string,
+) *hostConnPool {
 
 	pool := &hostConnPool{
 		session: session,
@@ -307,7 +317,7 @@ func newHostConnPool(session *Session, host *HostInfo, port, size int,
 		filling:            false,
 		closed:             false,
 		maintenanceStarted: false,
-		maintenanceTicker: defaultMaintenanceInterval,
+		maintenanceTicker:  defaultMaintenanceInterval,
 	}
 
 	// Start maintenance goroutine
@@ -361,8 +371,10 @@ func (pool *hostConnPool) Pick() *Conn {
 	return leastBusyConn
 }
 
-// startMaintenanceGoroutine starts a background goroutine that performs two tasks:
-// 1. Periodically scans active connections for expired ones and moves them to draining
+// startMaintenanceGoroutine starts a background goroutine that performs the
+// following two tasks:
+// 1. Periodically scans active connections for expired ones and moves them
+// to  draining
 // 2. Closes draining connections once they have no active streams
 // This removes expiration checking from the hot path (Pick method).
 func (pool *hostConnPool) startMaintenanceGoroutine() {
@@ -438,7 +450,8 @@ func (pool *hostConnPool) startMaintenanceGoroutine() {
 
 			}
 
-			// Step 2: Check draining connections and close those with no active streams
+			// Step 2: Check draining connections and close those with no
+			// active streams
 			pool.maintenanceMu.Lock()
 
 			drainingConns := make([]*Conn, 0, len(pool.expiredConns))
@@ -575,7 +588,10 @@ func (pool *hostConnPool) fill() {
 			// this is call with the connection pool mutex held, this call will
 			// then recursively try to lock it again. FIXME
 			if pool.session.cfg.ConvictionPolicy.AddFailure(err, pool.host) {
-				go pool.session.handleNodeDown(pool.host.ConnectAddress(), pool.port)
+				go pool.session.handleNodeDown(
+					pool.host.ConnectAddress(),
+					pool.port,
+				)
 			}
 			return
 		}
@@ -598,11 +614,19 @@ func (pool *hostConnPool) logConnectErr(err error) {
 		// connection refused
 		// these are typical during a node outage so avoid log spam.
 		if gocqlDebug {
-			Logger.Printf("unable to dial %q: %v\n", pool.host.ConnectAddress(), err)
+			Logger.Printf(
+				"unable to dial %q: %v\n",
+				pool.host.ConnectAddress(),
+				err,
+			)
 		}
 	} else if err != nil {
 		// unexpected error
-		Logger.Printf("error: failed to connect to %s due to error: %v", pool.addr, err)
+		Logger.Printf(
+			"error: failed to connect to %s due to error: %v",
+			pool.addr,
+			err,
+		)
 	}
 }
 
@@ -669,8 +693,10 @@ func (pool *hostConnPool) connect() (err error) {
 			}
 		}
 		if gocqlDebug {
-			Logger.Printf("connection failed %q: %v, reconnecting with %T\n",
-				pool.host.ConnectAddress(), err, reconnectionPolicy)
+			Logger.Printf(
+				"connection failed %q: %v, reconnecting with %T\n",
+				pool.host.ConnectAddress(), err, reconnectionPolicy,
+			)
 		}
 		time.Sleep(reconnectionPolicy.GetInterval(i))
 	}
