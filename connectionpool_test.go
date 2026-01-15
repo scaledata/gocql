@@ -7,9 +7,11 @@
 package gocql
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -978,6 +980,203 @@ func BenchmarkPickWithExpiration(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		pool.Pick()
+	}
+}
+
+// TestConnectionPool_RandomizedStressTest is a comprehensive randomized test
+// that exercises the connection pool with aggressive timing and various scenarios.
+// This test runs for a configurable duration and simulates:
+// - Concurrent Pick() calls from multiple goroutines
+// - Connections expiring and being replaced
+// - Periods of silence (no activity)
+// - Simulated slow requests (streams held for varying durations)
+// - Pool closure during activity
+//
+// The test uses aggressive configuration:
+// - maintenancePeriod = 1 second
+// - connectionLifetime = 2 seconds
+//
+// This test does NOT require a Cassandra server - it uses fake connections.
+func TestConnectionPool_RandomizedStressTest(t *testing.T) {
+	// Use shorter duration for regular test runs, longer for stress testing
+	testDuration := 5 * time.Second
+	if !testing.Short() {
+		testDuration = 30 * time.Second
+	}
+
+	const (
+		maintenancePeriod  = 1 * time.Second
+		connectionLifetime = 2 * time.Second
+		poolSize           = 5
+		numWorkers         = 10 // Concurrent goroutines calling Pick()
+		maxRequestDuration = 500 * time.Millisecond
+		silenceProbability = 0.1 // 10% chance of silence period
+		maxSilenceDuration = 3 * time.Second
+	)
+
+	session := createTestSession()
+	host := &HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 1),
+		port:           9042,
+	}
+
+	// Create pool with aggressive timing
+	pool := &hostConnPool{
+		session:            session,
+		host:               host,
+		port:               9042,
+		addr:               "127.0.0.1:9042",
+		size:               poolSize,
+		keyspace:           "",
+		conns:              make([]*Conn, 0, poolSize),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  maintenancePeriod,
+	}
+
+	// Pre-populate pool with connections
+	now := time.Now()
+	pool.mu.Lock()
+	for i := 0; i < poolSize; i++ {
+		conn := fakeConn(3, now, connectionLifetime)
+		pool.conns = append(pool.conns, conn)
+	}
+	pool.mu.Unlock()
+
+	// Start maintenance goroutine
+	pool.startMaintenanceGoroutine()
+
+	// Statistics tracking
+	var (
+		pickCount       int64
+		streamAllocated int64
+		silencePeriods  int64
+		errors          int64
+	)
+
+	// Context for test duration
+	ctx, cancel := context.WithTimeout(context.Background(), testDuration)
+	defer cancel()
+
+	// Worker goroutines that continuously call Pick() and simulate work
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			rng := time.Now().UnixNano() + int64(workerID)
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// Random silence periods
+				if float64(rng%100)/100.0 < silenceProbability {
+					silenceDur := time.Duration(rng % int64(maxSilenceDuration))
+					atomic.AddInt64(&silencePeriods, 1)
+					time.Sleep(silenceDur)
+					rng = rng*1103515245 + 12345 // Simple LCG
+					continue
+				}
+
+				// Pick a connection
+				conn := pool.Pick()
+				atomic.AddInt64(&pickCount, 1)
+
+				if conn == nil {
+					// Pool might be empty or closed
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+
+				// Simulate acquiring a stream
+				stream, ok := conn.streams.GetStream()
+				if !ok {
+					// No streams available
+					time.Sleep(1 * time.Millisecond)
+					rng = rng*1103515245 + 12345
+					continue
+				}
+
+				atomic.AddInt64(&streamAllocated, 1)
+
+				// Simulate work with random duration
+				workDuration := time.Duration(rng % int64(maxRequestDuration))
+				time.Sleep(workDuration)
+
+				// Release the stream
+				conn.streams.Clear(stream)
+
+				rng = rng*1103515245 + 12345 // Update RNG
+			}
+		}(i)
+	}
+
+	// Goroutine to periodically add new connections to simulate pool refilling
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pool.mu.Lock()
+				if !pool.closed && len(pool.conns) < poolSize {
+					// Add a new connection
+					newConn := fakeConn(3, time.Now(), connectionLifetime)
+					pool.conns = append(pool.conns, newConn)
+				}
+				pool.mu.Unlock()
+			}
+		}
+	}()
+
+	// Wait for test duration
+	<-ctx.Done()
+
+	// Close the pool
+	pool.Close()
+
+	// Wait for all workers to finish
+	wg.Wait()
+
+	// Report statistics
+	t.Logf("Stress test completed:")
+	t.Logf("  Duration: %v", testDuration)
+	t.Logf("  Pick() calls: %d", atomic.LoadInt64(&pickCount))
+	t.Logf("  Streams allocated: %d", atomic.LoadInt64(&streamAllocated))
+	t.Logf("  Silence periods: %d", atomic.LoadInt64(&silencePeriods))
+	t.Logf("  Errors: %d", atomic.LoadInt64(&errors))
+
+	// Verify pool is properly closed
+	pool.mu.RLock()
+	closed := pool.closed
+	connsCount := len(pool.conns)
+	pool.mu.RUnlock()
+
+	if !closed {
+		t.Errorf("Expected pool to be closed")
+	}
+
+	if connsCount != 0 {
+		t.Errorf(
+			"Expected pool.conns to be empty after close, got %d",
+			connsCount,
+		)
+	}
+
+	expiredConns := getExpiredConns(pool)
+	if expiredConns != nil {
+		t.Errorf("Expected pool.expiredConns to be nil after close")
 	}
 }
 
