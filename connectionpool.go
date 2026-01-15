@@ -338,18 +338,10 @@ func (pool *hostConnPool) Pick() *Conn {
 	}
 
 	size := len(pool.conns)
-	if size == 0 {
-		// this will create one connection synchronously and fill the pool
-		// asynchronously
-		pool.fill()
-	} else if size < pool.size {
+	if size < pool.size {
 		// try to fill the pool
 		go pool.fill()
 	}
-
-	// Start maintenance goroutine if not already running
-	// This handles expiration checking in the background
-	go pool.startMaintenanceGoroutine()
 
 	pos := int(atomic.AddUint32(&pool.pos, 1) - 1)
 
