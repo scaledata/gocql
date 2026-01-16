@@ -338,7 +338,12 @@ func (pool *hostConnPool) Pick() *Conn {
 	}
 
 	size := len(pool.conns)
-	if size < pool.size {
+	if size == 0 {
+		pool.mu.RUnlock()
+		// fill one connection synchronously
+		pool.fill()
+		pool.mu.RLock()
+	} else if size < pool.size {
 		// try to fill the pool
 		go pool.fill()
 	}
