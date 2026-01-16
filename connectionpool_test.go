@@ -1034,6 +1034,10 @@ func TestConnectionPool_RandomizedStressTest(t *testing.T) {
 		closed:             false,
 		maintenanceStarted: false,
 		maintenanceTicker:  maintenancePeriod,
+		// Inject fake connection factory for testing
+		connFactory: func() (*Conn, error) {
+			return fakeConn(3, time.Now(), connectionLifetime), nil
+		},
 	}
 
 	// Pre-populate pool with connections
@@ -1089,9 +1093,7 @@ func TestConnectionPool_RandomizedStressTest(t *testing.T) {
 				atomic.AddInt64(&pickCount, 1)
 
 				if conn == nil {
-					// Pool might be empty or closed
-					time.Sleep(10 * time.Millisecond)
-					continue
+					t.Fatal("Expected connection to not be nil")
 				}
 
 				// Simulate acquiring a stream
@@ -1116,29 +1118,6 @@ func TestConnectionPool_RandomizedStressTest(t *testing.T) {
 			}
 		}(i)
 	}
-
-	// Goroutine to periodically add new connections to simulate pool refilling
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				pool.mu.Lock()
-				if !pool.closed && len(pool.conns) < poolSize {
-					// Add a new connection
-					newConn := fakeConn(3, time.Now(), connectionLifetime)
-					pool.conns = append(pool.conns, newConn)
-				}
-				pool.mu.Unlock()
-			}
-		}
-	}()
 
 	// Wait for test duration
 	<-ctx.Done()
