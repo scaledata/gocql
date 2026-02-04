@@ -47,6 +47,7 @@ type ClusterConfig struct {
 	ProtoVersion       int
 	Timeout            time.Duration      // connection timeout (default: 600ms)
 	ConnectTimeout     time.Duration      // initial connection timeout, used during initial dial to server (default: 600ms)
+	ConnMaxLifetime    time.Duration      // SetConnMaxLifetime sets the maximum amount of time a connection may be reused.
 	Port               int                // port (default: 9042)
 	Keyspace           string             // initial keyspace (optional)
 	NumConns           int                // number of connections per host (default: 2)
