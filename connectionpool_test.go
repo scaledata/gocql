@@ -7,9 +7,11 @@
 package gocql
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,11 +22,20 @@ import (
 type fakeNetConn struct {
 	net.Conn
 	closed bool
+	mu     sync.Mutex
 }
 
 func (m *fakeNetConn) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.closed = true
 	return nil
+}
+
+func (m *fakeNetConn) IsClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
 }
 
 func (m *fakeNetConn) RemoteAddr() net.Addr {
@@ -38,14 +49,70 @@ func (m *fakeErrorHandler) HandleError(conn *Conn, err error, closed bool) {
 	// No-op for testing
 }
 
-// fakeConn creates a fake connection for testing
-func fakeConn(
+// connectionTracker tracks fake connections created during tests to verify
+// they are properly closed.
+type connectionTracker struct {
+	mu    sync.Mutex
+	conns []*fakeNetConn
+}
+
+// track records a fake connection for later verification
+func (ct *connectionTracker) track(conn *fakeNetConn) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	ct.conns = append(ct.conns, conn)
+}
+
+// verifyAllClosed checks that all tracked connections were closed
+func (ct *connectionTracker) verifyAllClosed(t *testing.T) {
+	t.Helper()
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	var leaks []int
+	for i, conn := range ct.conns {
+		if !conn.IsClosed() {
+			leaks = append(leaks, i)
+		}
+	}
+
+	if len(leaks) > 0 {
+		t.Errorf(
+			"Connection leak detected: %d/%d connections not closed: %v",
+			len(leaks), len(ct.conns), leaks,
+		)
+	}
+}
+
+// stats returns the number of connections created and closed
+func (ct *connectionTracker) stats() (created, closed, leaked int) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	created = len(ct.conns)
+	for _, conn := range ct.conns {
+		if conn.IsClosed() {
+			closed++
+		}
+	}
+	leaked = created - closed
+	return
+}
+
+// fakeConnWithTracker creates a fake connection and registers it with the tracker
+func fakeConnWithTracker(
 	protocol int,
 	createdAt time.Time,
 	maxLifetime time.Duration,
+	tracker *connectionTracker,
 ) *Conn {
+	netConn := &fakeNetConn{}
+	if tracker != nil {
+		tracker.track(netConn)
+	}
+
 	return &Conn{
-		conn:         &fakeNetConn{},
+		conn:         netConn,
 		streams:      streams.New(protocol),
 		cfg:          &ConnConfig{ConnMaxLifetime: maxLifetime},
 		createdAt:    createdAt,
@@ -54,6 +121,16 @@ func fakeConn(
 		quit:         make(chan struct{}),
 		errorHandler: &fakeErrorHandler{},
 	}
+}
+
+// fakeConn creates a fake connection for testing without tracking.
+// For tests that need leak detection, use fakeConnWithTracker instead.
+func fakeConn(
+	protocol int,
+	createdAt time.Time,
+	maxLifetime time.Duration,
+) *Conn {
+	return fakeConnWithTracker(protocol, createdAt, maxLifetime, nil)
 }
 
 // getExpiredConnsCount returns the number of connections in the draining pool
@@ -981,6 +1058,210 @@ func BenchmarkPickWithExpiration(b *testing.B) {
 	}
 }
 
+// TestConnectionPool_RandomizedStressTest is a comprehensive randomized test
+// that exercises the connection pool with aggressive timing and various scenarios.
+// This test runs for a configurable duration and simulates:
+// - Concurrent Pick() calls from multiple goroutines
+// - Connections expiring and being replaced
+// - Periods of silence (no activity)
+// - Simulated slow requests (streams held for varying durations)
+// - Pool closure during activity
+//
+// The test uses aggressive configuration:
+// - maintenancePeriod = 1 second
+// - connectionLifetime = 2 seconds
+//
+// This test does NOT require a Cassandra server - it uses fake connections.
+func TestConnectionPool_RandomizedStressTest(t *testing.T) {
+	// Use shorter duration for regular test runs, longer for stress testing
+	testDuration := 5 * time.Second
+	if !testing.Short() {
+		testDuration = 30 * time.Second
+	}
+
+	const (
+		maintenancePeriod  = 1 * time.Second
+		connectionLifetime = 2 * time.Second
+		poolSize           = 5
+		numWorkers         = 10 // Concurrent goroutines calling Pick()
+		maxRequestDuration = 500 * time.Millisecond
+		silenceProbability = 0.1 // 10% chance of silence period
+		maxSilenceDuration = 3 * time.Second
+	)
+
+	session := createTestSession()
+	host := &HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 1),
+		port:           9042,
+	}
+
+	// Create connection tracker for leak detection
+	tracker := &connectionTracker{}
+
+	// Create pool with aggressive timing
+	pool := &hostConnPool{
+		session:            session,
+		host:               host,
+		port:               9042,
+		addr:               "127.0.0.1:9042",
+		size:               poolSize,
+		keyspace:           "",
+		conns:              make([]*Conn, 0, poolSize),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  maintenancePeriod,
+		// Inject fake connection factory with tracker for testing
+		connFactory: func() (*Conn, error) {
+			return fakeConnWithTracker(
+				3, time.Now(), connectionLifetime,
+				tracker,
+			), nil
+		},
+	}
+
+	// Pre-populate pool with connections
+	now := time.Now()
+	pool.mu.Lock()
+	for i := 0; i < poolSize; i++ {
+		conn := fakeConnWithTracker(3, now, connectionLifetime, tracker)
+		pool.conns = append(pool.conns, conn)
+	}
+	pool.mu.Unlock()
+
+	// Start maintenance goroutine
+	pool.startMaintenanceGoroutine()
+
+	// Statistics tracking
+	var (
+		pickCount       int64
+		streamAllocated int64
+		silencePeriods  int64
+		errors          int64
+	)
+
+	// Context for test duration
+	ctx, cancel := context.WithTimeout(context.Background(), testDuration)
+	defer cancel()
+
+	// Worker goroutines that continuously call Pick() and simulate work
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			rng := time.Now().UnixNano() + int64(workerID)
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// Random silence periods
+				if float64(rng%100)/100.0 < silenceProbability {
+					silenceDur := time.Duration(rng % int64(maxSilenceDuration))
+					atomic.AddInt64(&silencePeriods, 1)
+					time.Sleep(silenceDur)
+					rng = rng*1103515245 + 12345 // Simple LCG
+					continue
+				}
+
+				// Pick a connection
+				conn := pool.Pick()
+				atomic.AddInt64(&pickCount, 1)
+
+				if conn == nil {
+					t.Fatal("Expected connection to not be nil")
+				}
+
+				// Simulate acquiring a stream
+				stream, ok := conn.streams.GetStream()
+				if !ok {
+					// No streams available
+					time.Sleep(1 * time.Millisecond)
+					rng = rng*1103515245 + 12345
+					continue
+				}
+
+				atomic.AddInt64(&streamAllocated, 1)
+
+				// Simulate work with random duration
+				workDuration := time.Duration(rng % int64(maxRequestDuration))
+				time.Sleep(workDuration)
+
+				// Release the stream
+				conn.streams.Clear(stream)
+
+				rng = rng*1103515245 + 12345 // Update RNG
+			}
+		}(i)
+	}
+
+	// Wait for test duration
+	<-ctx.Done()
+
+	// Close the pool
+	pool.Close()
+
+	// Wait for all workers to finish
+	wg.Wait()
+
+	// Report statistics
+	t.Logf("Stress test completed:")
+	t.Logf("  Duration: %v", testDuration)
+	t.Logf("  Pick() calls: %d", atomic.LoadInt64(&pickCount))
+	t.Logf("  Streams allocated: %d", atomic.LoadInt64(&streamAllocated))
+	t.Logf("  Silence periods: %d", atomic.LoadInt64(&silencePeriods))
+	t.Logf("  Errors: %d", atomic.LoadInt64(&errors))
+
+	// Verify pool is properly closed
+	pool.mu.RLock()
+	poolClosed := pool.closed
+	connsCount := len(pool.conns)
+	pool.mu.RUnlock()
+
+	if !poolClosed {
+		t.Errorf("Expected pool to be closed")
+	}
+
+	if connsCount != 0 {
+		t.Errorf(
+			"Expected pool.conns to be empty after close, got %d",
+			connsCount,
+		)
+	}
+
+	expiredConns := getExpiredConns(pool)
+	if expiredConns != nil {
+		t.Errorf("Expected pool.expiredConns to be nil after close")
+	}
+
+	// Wait for all connections to be closed
+	if err := TimedWaitForFnForTest(
+		func() bool {
+			created, closed, _ := tracker.stats()
+			return created > 0 && created == closed
+		}, 1*time.Second,
+	); err != nil {
+		t.Fatalf("Timed out waiting for all connections to close: %v", err)
+	}
+
+	// Verify no connection leaks
+	tracker.verifyAllClosed(t)
+
+	// Report connection statistics
+	created, closed, leaked := tracker.stats()
+	t.Logf(
+		"Connection stats: created=%d, closed=%d, leaked=%d",
+		created,
+		closed,
+		leaked,
+	)
+}
+
 // TestMaintenanceGoroutine_ConfigurableInterval demonstrates using a custom
 // ticker interval for testing.
 //
@@ -1063,5 +1344,198 @@ func TimedWaitForFnForTest(fn func() bool, timeout time.Duration) error {
 		case <-timeoutC:
 			return fmt.Errorf("Timed out waiting for function to return true")
 		}
+	}
+}
+
+// TestConnectionTracking_NoLeaks verifies that all connections created by the
+// pool are properly closed and no leaks occur during normal operation
+func TestConnectionTracking_NoLeaks(t *testing.T) {
+	session := createTestSession()
+	host := &HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 1),
+		port:           9042,
+	}
+
+	poolSize := 5
+	connectionLifetime := 500 * time.Millisecond
+	tracker := &connectionTracker{}
+
+	// Create pool with tracked fake connections
+	pool := &hostConnPool{
+		session:            session,
+		host:               host,
+		port:               9042,
+		addr:               "127.0.0.1:9042",
+		size:               poolSize,
+		keyspace:           "",
+		conns:              make([]*Conn, 0, poolSize),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  100 * time.Millisecond,
+		connFactory: func() (*Conn, error) {
+			return fakeConnWithTracker(
+				3, time.Now(), connectionLifetime,
+				tracker,
+			), nil
+		},
+	}
+
+	// Start maintenance goroutine
+	pool.startMaintenanceGoroutine()
+
+	// Fill the pool
+	pool.fill()
+
+	// Wait for pool to be filled
+	if err := TimedWaitForFnForTest(
+		func() bool {
+			pool.mu.RLock()
+			defer pool.mu.RUnlock()
+			return len(pool.conns) >= poolSize
+		}, 500*time.Millisecond,
+	); err != nil {
+		t.Fatalf("Timed out waiting for pool to be filled: %v", err)
+	}
+
+	// Verify initial connections
+	pool.mu.RLock()
+	initialCount := len(pool.conns)
+	pool.mu.RUnlock()
+
+	if initialCount == 0 {
+		t.Fatal("Pool should have connections after fill()")
+	}
+
+	// Let connections expire and be replaced
+	time.Sleep(1 * time.Second)
+
+	// Pick some connections to simulate usage
+	for i := 0; i < 10; i++ {
+		conn := pool.Pick()
+		if conn != nil {
+			// Simulate using the connection
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Close the pool
+	pool.Close()
+
+	// Wait for all connections to be closed
+	if err := TimedWaitForFnForTest(
+		func() bool {
+			created, closed, _ := tracker.stats()
+			return created > 0 && created == closed
+		}, 500*time.Millisecond,
+	); err != nil {
+		t.Fatalf("Timed out waiting for all connections to close: %v", err)
+	}
+
+	// Verify no connection leaks using the tracker
+	tracker.verifyAllClosed(t)
+
+	// Print stats for debugging
+	created, closed, leaked := tracker.stats()
+	t.Logf(
+		"Connection stats: created=%d, closed=%d, leaked=%d",
+		created,
+		closed,
+		leaked,
+	)
+}
+
+// TestConnectionTracking_WithExpiration verifies that expired connections
+// are properly tracked and closed
+func TestConnectionTracking_WithExpiration(t *testing.T) {
+	session := createTestSession()
+	host := &HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 1),
+		port:           9042,
+	}
+
+	poolSize := 3
+	connectionLifetime := 200 * time.Millisecond
+	tracker := &connectionTracker{}
+
+	// Create pool with tracked fake connections
+	pool := &hostConnPool{
+		session:            session,
+		host:               host,
+		port:               9042,
+		addr:               "127.0.0.1:9042",
+		size:               poolSize,
+		keyspace:           "",
+		conns:              make([]*Conn, 0, poolSize),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  50 * time.Millisecond,
+		connFactory: func() (*Conn, error) {
+			return fakeConnWithTracker(
+				3,
+				time.Now(),
+				connectionLifetime,
+				tracker,
+			), nil
+		},
+	}
+
+	// Pre-populate with connections
+	now := time.Now()
+	pool.mu.Lock()
+	for i := 0; i < poolSize; i++ {
+		conn := fakeConnWithTracker(3, now, connectionLifetime, tracker)
+		pool.conns = append(pool.conns, conn)
+	}
+	pool.mu.Unlock()
+
+	// Start maintenance goroutine
+	pool.startMaintenanceGoroutine()
+
+	// Wait for connections to expire and be replaced multiple times
+	// Pick connections to trigger fill() when pool becomes empty
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		conn := pool.Pick()
+		if conn != nil {
+			// Use the connection briefly
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Close the pool
+	pool.Close()
+
+	// Wait for all connections to be closed
+	if err := TimedWaitForFnForTest(
+		func() bool {
+			created, closed, _ := tracker.stats()
+			return created > 0 && created == closed
+		}, 500*time.Millisecond,
+	); err != nil {
+		t.Fatalf("Timed out waiting for all connections to close: %v", err)
+	}
+
+	// Verify no connection leaks using the tracker
+	tracker.verifyAllClosed(t)
+
+	// Verify that connections were properly tracked
+	created, closed, leaked := tracker.stats()
+	t.Logf(
+		"Connection stats: created=%d, closed=%d, leaked=%d",
+		created,
+		closed,
+		leaked,
+	)
+
+	// We should have created at least the initial pool size
+	if created < poolSize {
+		t.Errorf(
+			"Expected at least %d connections to be created, got %d",
+			poolSize, created,
+		)
 	}
 }

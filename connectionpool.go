@@ -277,6 +277,13 @@ type hostConnPool struct {
 	expiredConns       []*Conn
 	maintenanceStarted bool
 	maintenanceTicker  time.Duration
+
+	// connFactory is the function used to create new connections.
+	// By default, this is set to defaultConnFactory which implements the
+	// standard production connection logic with retry policy and keyspace setting.
+	// Tests can override this to inject fake connections.
+	connFactory     func() (*Conn, error)
+	connFactoryOnce sync.Once
 }
 
 const (
@@ -319,6 +326,10 @@ func newHostConnPool(
 		maintenanceStarted: false,
 		maintenanceTicker:  defaultMaintenanceInterval,
 	}
+
+	// Set the default connection factory
+	// Tests can override this by setting pool.connFactory directly
+	pool.connFactory = pool.defaultConnFactory()
 
 	// Start maintenance goroutine
 	// This handles expiration checking in the background
@@ -673,44 +684,69 @@ func (pool *hostConnPool) connectMany(count int) error {
 	return connectErr
 }
 
+// defaultConnFactory creates a connection factory that implements the standard
+// production connection logic with retry policy and keyspace setting.
+// This factory is used by default for all connection pools.
+func (pool *hostConnPool) defaultConnFactory() func() (*Conn, error) {
+	return func() (*Conn, error) {
+		var conn *Conn
+		var err error
+
+		reconnectionPolicy := pool.session.cfg.ReconnectionPolicy
+		for i := 0; i < reconnectionPolicy.GetMaxRetries(); i++ {
+			conn, err = pool.session.connect(pool.host, pool)
+			if err == nil {
+				break
+			}
+			if opErr, isOpErr := err.(*net.OpError); isOpErr {
+				// if the error is not a temporary error (ex: network unreachable) don't
+				// retry
+				if !opErr.Temporary() {
+					break
+				}
+			}
+			if gocqlDebug {
+				Logger.Printf(
+					"connection failed %q: %v, reconnecting with %T\n",
+					pool.host.ConnectAddress(), err, reconnectionPolicy,
+				)
+			}
+			time.Sleep(reconnectionPolicy.GetInterval(i))
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		if pool.keyspace != "" {
+			// set the keyspace
+			if err = conn.UseKeyspace(pool.keyspace); err != nil {
+				conn.Close()
+				return nil, err
+			}
+		}
+
+		return conn, nil
+	}
+}
+
 // create a new connection to the host and add it to the pool
 func (pool *hostConnPool) connect() (err error) {
 	// TODO: provide a more robust connection retry mechanism, we should also
 	// be able to detect hosts that come up by trying to connect to downed ones.
-	// try to connect
-	var conn *Conn
-	reconnectionPolicy := pool.session.cfg.ReconnectionPolicy
-	for i := 0; i < reconnectionPolicy.GetMaxRetries(); i++ {
-		conn, err = pool.session.connect(pool.host, pool)
-		if err == nil {
-			break
-		}
-		if opErr, isOpErr := err.(*net.OpError); isOpErr {
-			// if the error is not a temporary error (ex: network unreachable) don't
-			//  retry
-			if !opErr.Temporary() {
-				break
-			}
-		}
-		if gocqlDebug {
-			Logger.Printf(
-				"connection failed %q: %v, reconnecting with %T\n",
-				pool.host.ConnectAddress(), err, reconnectionPolicy,
-			)
-		}
-		time.Sleep(reconnectionPolicy.GetInterval(i))
-	}
 
+	// Ensure factory is initialized (for tests that create pools directly)
+	// Use sync.Once to ensure thread-safe initialization
+	pool.connFactoryOnce.Do(func() {
+		if pool.connFactory == nil {
+			pool.connFactory = pool.defaultConnFactory()
+		}
+	})
+
+	// Create connection using the factory (default or test-injected)
+	conn, err := pool.connFactory()
 	if err != nil {
 		return err
-	}
-
-	if pool.keyspace != "" {
-		// set the keyspace
-		if err = conn.UseKeyspace(pool.keyspace); err != nil {
-			conn.Close()
-			return err
-		}
 	}
 
 	// add the Conn to the pool
