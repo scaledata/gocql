@@ -40,7 +40,10 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 
 		pem, err := ioutil.ReadFile(sslOpts.CaPath)
 		if err != nil {
-			return nil, fmt.Errorf("connectionpool: unable to open CA certs: %v", err)
+			return nil, fmt.Errorf(
+				"connectionpool: unable to open CA certs: %v",
+				err,
+			)
 		}
 
 		if !sslOpts.RootCAs.AppendCertsFromPEM(pem) {
@@ -51,7 +54,10 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 	if sslOpts.CertPath != "" || sslOpts.KeyPath != "" {
 		mycert, err := tls.LoadX509KeyPair(sslOpts.CertPath, sslOpts.KeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("connectionpool: unable to load X509 key pair: %v", err)
+			return nil, fmt.Errorf(
+				"connectionpool: unable to load X509 key pair: %v",
+				err,
+			)
 		}
 		sslOpts.Certificates = append(sslOpts.Certificates, mycert)
 	}
@@ -89,14 +95,15 @@ func connConfig(cfg *ClusterConfig) (*ConnConfig, error) {
 	}
 
 	return &ConnConfig{
-		ProtoVersion:   cfg.ProtoVersion,
-		CQLVersion:     cfg.CQLVersion,
-		Timeout:        cfg.Timeout,
-		ConnectTimeout: cfg.ConnectTimeout,
-		Compressor:     cfg.Compressor,
-		Authenticator:  cfg.Authenticator,
-		Keepalive:      cfg.SocketKeepalive,
-		tlsConfig:      tlsConfig,
+		ProtoVersion:    cfg.ProtoVersion,
+		CQLVersion:      cfg.CQLVersion,
+		Timeout:         cfg.Timeout,
+		ConnectTimeout:  cfg.ConnectTimeout,
+		ConnMaxLifetime: cfg.ConnMaxLifetime,
+		Compressor:      cfg.Compressor,
+		Authenticator:   cfg.Authenticator,
+		Keepalive:       cfg.SocketKeepalive,
+		tlsConfig:       tlsConfig,
 	}, nil
 }
 
@@ -255,36 +262,78 @@ type hostConnPool struct {
 	addr     string
 	size     int
 	keyspace string
-	// protection for conns, closed, filling
+	// mu protects conns, closed, filling
+	// Used by hot path (Pick method) - keep contention minimal
 	mu      sync.RWMutex
 	conns   []*Conn
 	closed  bool
 	filling bool
 
 	pos uint32
+
+	// maintenanceMu protects expiredConns and maintenance goroutine state
+	// Used only by maintenance goroutine and Close() - separate from hot path
+	maintenanceMu      sync.Mutex
+	expiredConns       []*Conn
+	maintenanceStarted bool
+	maintenanceTicker  time.Duration
+
+	// connFactory is the function used to create new connections.
+	// By default, this is set to defaultConnFactory which implements the
+	// standard production connection logic with retry policy and keyspace setting.
+	// Tests can override this to inject fake connections.
+	connFactory     func() (*Conn, error)
+	connFactoryOnce sync.Once
 }
+
+const (
+	// Maximum number of connections that can be in draining state
+	// This prevents opening too many new connections while old ones drain
+	maxDrainingConns = 10
+
+	// Default interval for maintenance goroutine to check for expired connections
+	defaultMaintenanceInterval = 30 * time.Second
+)
 
 func (h *hostConnPool) String() string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return fmt.Sprintf("[filling=%v closed=%v conns=%v size=%v host=%v]",
-		h.filling, h.closed, len(h.conns), h.size, h.host)
+	return fmt.Sprintf(
+		"[filling=%v closed=%v conns=%v size=%v host=%v]",
+		h.filling, h.closed, len(h.conns), h.size, h.host,
+	)
 }
 
-func newHostConnPool(session *Session, host *HostInfo, port, size int,
-	keyspace string) *hostConnPool {
+func newHostConnPool(
+	session *Session, host *HostInfo, port, size int,
+	keyspace string,
+) *hostConnPool {
 
 	pool := &hostConnPool{
-		session:  session,
-		host:     host,
-		port:     port,
-		addr:     (&net.TCPAddr{IP: host.ConnectAddress(), Port: host.Port()}).String(),
-		size:     size,
-		keyspace: keyspace,
-		conns:    make([]*Conn, 0, size),
-		filling:  false,
-		closed:   false,
+		session: session,
+		host:    host,
+		port:    port,
+		addr: (&net.TCPAddr{
+			IP:   host.ConnectAddress(),
+			Port: host.Port(),
+		}).String(),
+		size:               size,
+		keyspace:           keyspace,
+		conns:              make([]*Conn, 0, size),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  defaultMaintenanceInterval,
 	}
+
+	// Set the default connection factory
+	// Tests can override this by setting pool.connFactory directly
+	pool.connFactory = pool.defaultConnFactory()
+
+	// Start maintenance goroutine
+	// This handles expiration checking in the background
+	pool.startMaintenanceGoroutine()
 
 	// the pool is not filled or connected
 	return pool
@@ -300,13 +349,17 @@ func (pool *hostConnPool) Pick() *Conn {
 	}
 
 	size := len(pool.conns)
+	for size == 0 {
+		pool.mu.RUnlock()
+		// fill one connection synchronously
+		pool.fill()
+		pool.mu.RLock()
+		// Re-read size after filling
+		size = len(pool.conns)
+	}
 	if size < pool.size {
 		// try to fill the pool
 		go pool.fill()
-
-		if size == 0 {
-			return nil
-		}
 	}
 
 	pos := int(atomic.AddUint32(&pool.pos, 1) - 1)
@@ -319,6 +372,7 @@ func (pool *hostConnPool) Pick() *Conn {
 	// find the conn which has the most available streams, this is racy
 	for i := 0; i < size; i++ {
 		conn := pool.conns[(pos+i)%size]
+
 		if streams := conn.AvailableStreams(); streams > streamsAvailable {
 			leastBusyConn = conn
 			streamsAvailable = streams
@@ -328,7 +382,111 @@ func (pool *hostConnPool) Pick() *Conn {
 	return leastBusyConn
 }
 
-//Size returns the number of connections currently active in the pool
+// startMaintenanceGoroutine starts a background goroutine that performs the
+// following two tasks:
+// 1. Periodically scans active connections for expired ones and moves them
+// to  draining
+// 2. Closes draining connections once they have no active streams
+// This removes expiration checking from the hot path (Pick method).
+func (pool *hostConnPool) startMaintenanceGoroutine() {
+	pool.maintenanceMu.Lock()
+	defer pool.maintenanceMu.Unlock()
+
+	if pool.maintenanceStarted {
+		return
+	}
+
+	pool.maintenanceStarted = true
+
+	go func() {
+		ticker := time.NewTicker(pool.maintenanceTicker)
+		defer ticker.Stop()
+
+		// Perform an immediate check, then continue with periodic checks
+		for {
+			// Perform maintenance work
+			pool.mu.RLock()
+
+			if pool.closed {
+				pool.mu.RUnlock()
+				pool.maintenanceMu.Lock()
+				pool.maintenanceStarted = false
+				pool.maintenanceMu.Unlock()
+				return
+			}
+
+			// Step 1: Scan active connections for expired ones
+			// Move expired connections from active pool to draining pool
+			expiredConns := make([]*Conn, 0)
+			activeConns := make([]*Conn, 0, len(pool.conns))
+
+			// Get current draining count while holding maintenanceMu
+			pool.maintenanceMu.Lock()
+			currentDrainingCount := len(pool.expiredConns)
+			pool.maintenanceMu.Unlock()
+
+			for _, conn := range pool.conns {
+				if conn.IsExpired() {
+					// Only move to draining if we haven't hit the limit
+					if currentDrainingCount+len(expiredConns) < maxDrainingConns {
+						expiredConns = append(expiredConns, conn)
+					} else {
+						// Hit the draining limit, keep in active pool for now
+						activeConns = append(activeConns, conn)
+					}
+				} else {
+					// Not expired, keep in active pool
+					activeConns = append(activeConns, conn)
+				}
+			}
+
+			pool.mu.RUnlock()
+
+			// Update the active connection pool and add to draining pool
+			if len(expiredConns) > 0 {
+				pool.mu.Lock()
+				if pool.closed {
+					pool.mu.Unlock()
+					pool.maintenanceMu.Lock()
+					pool.maintenanceStarted = false
+					pool.maintenanceMu.Unlock()
+					return
+				}
+				pool.conns = activeConns
+				pool.mu.Unlock()
+
+				pool.maintenanceMu.Lock()
+				pool.expiredConns = append(pool.expiredConns, expiredConns...)
+				pool.maintenanceMu.Unlock()
+
+			}
+
+			// Step 2: Check draining connections and close those with no
+			// active streams
+			pool.maintenanceMu.Lock()
+
+			drainingConns := make([]*Conn, 0, len(pool.expiredConns))
+			for _, conn := range pool.expiredConns {
+				// Check if all streams are available (meaning none are in use)
+				// NumStreams - 1 accounts for the reserved stream 0
+				if conn.AvailableStreams() >= conn.streams.NumStreams-1 {
+					// All streams are free, safe to close
+					conn.Close()
+				} else {
+					// Still has active streams, keep draining
+					drainingConns = append(drainingConns, conn)
+				}
+			}
+			pool.expiredConns = drainingConns
+			pool.maintenanceMu.Unlock()
+
+			// Wait for next tick
+			<-ticker.C
+		}
+	}()
+}
+
+// Size returns the number of connections currently active in the pool
 func (pool *hostConnPool) Size() int {
 	pool.mu.RLock()
 	defer pool.mu.RUnlock()
@@ -336,7 +494,16 @@ func (pool *hostConnPool) Size() int {
 	return len(pool.conns)
 }
 
-//Close the connection pool
+// DrainingSize returns the number of connections currently in the draining pool
+// This is primarily used for testing
+func (pool *hostConnPool) DrainingSize() int {
+	pool.maintenanceMu.Lock()
+	defer pool.maintenanceMu.Unlock()
+
+	return len(pool.expiredConns)
+}
+
+// Close the connection pool
 func (pool *hostConnPool) Close() {
 	pool.mu.Lock()
 
@@ -361,8 +528,19 @@ func (pool *hostConnPool) Close() {
 
 	pool.mu.Unlock()
 
-	// close the connections
+	// Also close any draining connections
+	pool.maintenanceMu.Lock()
+	expiredConns := pool.expiredConns
+	pool.expiredConns = nil
+	pool.maintenanceMu.Unlock()
+
+	// close the active connections
 	for _, conn := range conns {
+		conn.Close()
+	}
+
+	// close the draining connections
+	for _, conn := range expiredConns {
 		conn.Close()
 	}
 }
@@ -421,7 +599,10 @@ func (pool *hostConnPool) fill() {
 			// this is call with the connection pool mutex held, this call will
 			// then recursively try to lock it again. FIXME
 			if pool.session.cfg.ConvictionPolicy.AddFailure(err, pool.host) {
-				go pool.session.handleNodeDown(pool.host.ConnectAddress(), pool.port)
+				go pool.session.handleNodeDown(
+					pool.host.ConnectAddress(),
+					pool.port,
+				)
 			}
 			return
 		}
@@ -444,11 +625,19 @@ func (pool *hostConnPool) logConnectErr(err error) {
 		// connection refused
 		// these are typical during a node outage so avoid log spam.
 		if gocqlDebug {
-			Logger.Printf("unable to dial %q: %v\n", pool.host.ConnectAddress(), err)
+			Logger.Printf(
+				"unable to dial %q: %v\n",
+				pool.host.ConnectAddress(),
+				err,
+			)
 		}
 	} else if err != nil {
 		// unexpected error
-		Logger.Printf("error: failed to connect to %s due to error: %v", pool.addr, err)
+		Logger.Printf(
+			"error: failed to connect to %s due to error: %v",
+			pool.addr,
+			err,
+		)
 	}
 }
 
@@ -495,42 +684,69 @@ func (pool *hostConnPool) connectMany(count int) error {
 	return connectErr
 }
 
+// defaultConnFactory creates a connection factory that implements the standard
+// production connection logic with retry policy and keyspace setting.
+// This factory is used by default for all connection pools.
+func (pool *hostConnPool) defaultConnFactory() func() (*Conn, error) {
+	return func() (*Conn, error) {
+		var conn *Conn
+		var err error
+
+		reconnectionPolicy := pool.session.cfg.ReconnectionPolicy
+		for i := 0; i < reconnectionPolicy.GetMaxRetries(); i++ {
+			conn, err = pool.session.connect(pool.host, pool)
+			if err == nil {
+				break
+			}
+			if opErr, isOpErr := err.(*net.OpError); isOpErr {
+				// if the error is not a temporary error (ex: network unreachable) don't
+				// retry
+				if !opErr.Temporary() {
+					break
+				}
+			}
+			if gocqlDebug {
+				Logger.Printf(
+					"connection failed %q: %v, reconnecting with %T\n",
+					pool.host.ConnectAddress(), err, reconnectionPolicy,
+				)
+			}
+			time.Sleep(reconnectionPolicy.GetInterval(i))
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		if pool.keyspace != "" {
+			// set the keyspace
+			if err = conn.UseKeyspace(pool.keyspace); err != nil {
+				conn.Close()
+				return nil, err
+			}
+		}
+
+		return conn, nil
+	}
+}
+
 // create a new connection to the host and add it to the pool
 func (pool *hostConnPool) connect() (err error) {
 	// TODO: provide a more robust connection retry mechanism, we should also
 	// be able to detect hosts that come up by trying to connect to downed ones.
-	// try to connect
-	var conn *Conn
-	reconnectionPolicy := pool.session.cfg.ReconnectionPolicy
-	for i := 0; i < reconnectionPolicy.GetMaxRetries(); i++ {
-		conn, err = pool.session.connect(pool.host, pool)
-		if err == nil {
-			break
-		}
-		if opErr, isOpErr := err.(*net.OpError); isOpErr {
-			// if the error is not a temporary error (ex: network unreachable) don't
-			//  retry
-			if !opErr.Temporary() {
-				break
-			}
-		}
-		if gocqlDebug {
-			Logger.Printf("connection failed %q: %v, reconnecting with %T\n",
-				pool.host.ConnectAddress(), err, reconnectionPolicy)
-		}
-		time.Sleep(reconnectionPolicy.GetInterval(i))
-	}
 
+	// Ensure factory is initialized (for tests that create pools directly)
+	// Use sync.Once to ensure thread-safe initialization
+	pool.connFactoryOnce.Do(func() {
+		if pool.connFactory == nil {
+			pool.connFactory = pool.defaultConnFactory()
+		}
+	})
+
+	// Create connection using the factory (default or test-injected)
+	conn, err := pool.connFactory()
 	if err != nil {
 		return err
-	}
-
-	if pool.keyspace != "" {
-		// set the keyspace
-		if err = conn.UseKeyspace(pool.keyspace); err != nil {
-			conn.Close()
-			return err
-		}
 	}
 
 	// add the Conn to the pool
