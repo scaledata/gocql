@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gocql/gocql/internal/streams"
+	"github.com/scaledata/gocql/internal/streams"
 )
 
 // fakeNetConn is a fake net.Conn for testing
