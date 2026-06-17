@@ -349,13 +349,22 @@ func (pool *hostConnPool) Pick() *Conn {
 	}
 
 	size := len(pool.conns)
-	for size == 0 {
+	if size == 0 {
 		pool.mu.RUnlock()
-		// fill one connection synchronously
+		// Make a single synchronous attempt to fill one connection. We must
+		// not loop here: if the host is unreachable, fill() can never succeed
+		// and a loop would spin forever below the query layer, where no query
+		// timeout or retry limit can interrupt it. Returning nil instead lets
+		// the caller (query executor) move to the next host and rely on its
+		// retry/timeout logic, while the background fill() kicked off below
+		// repopulates the pool for subsequent picks.
 		pool.fill()
 		pool.mu.RLock()
 		// Re-read size after filling
 		size = len(pool.conns)
+		if size == 0 {
+			return nil
+		}
 	}
 	if size < pool.size {
 		// try to fill the pool
