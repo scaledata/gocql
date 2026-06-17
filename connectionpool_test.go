@@ -1539,3 +1539,101 @@ func TestConnectionTracking_WithExpiration(t *testing.T) {
 		)
 	}
 }
+
+// TestPick_UnreachableHostDoesNotHang is a regression test for the unbounded
+// loop that previously lived in Pick(). When the pool is empty and the host is
+// unreachable, fill() can never succeed; the old code looped on fill()
+// forever, hanging below the query layer where no query timeout or retry limit
+// could interrupt it (observed as 60-minute TestCyclopsFuzzy timeouts).
+//
+// The fixed Pick() makes a single synchronous fill attempt and then returns
+// nil, letting the caller's retry/timeout logic take over.
+func TestPick_UnreachableHostDoesNotHang(t *testing.T) {
+	session := createTestSession()
+	host := &HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 1),
+		port:           9042,
+	}
+
+	pool := &hostConnPool{
+		session:            session,
+		host:               host,
+		port:               9042,
+		addr:               "127.0.0.1:9042",
+		size:               3,
+		keyspace:           "",
+		conns:              make([]*Conn, 0, 3),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  100 * time.Millisecond,
+		// Simulate an unreachable host: every connection attempt fails, so the
+		// pool can never be filled.
+		connFactory: func() (*Conn, error) {
+			return nil, fmt.Errorf("simulated unreachable host")
+		},
+	}
+
+	// Run Pick() in a goroutine so the test itself cannot hang: if Pick()
+	// regresses to the unbounded loop, the select below fails fast instead of
+	// blocking the whole test binary until the go test timeout.
+	done := make(chan *Conn, 1)
+	go func() {
+		done <- pool.Pick()
+	}()
+
+	select {
+	case conn := <-done:
+		if conn != nil {
+			t.Fatalf("expected Pick() to return nil for an unreachable host, got %p", conn)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pick() hung on an unreachable host (regression: unbounded fill loop)")
+	}
+}
+
+// TestPick_EmptyPoolFillsSynchronously verifies that the single synchronous
+// fill attempt is preserved: when the pool starts empty but the host is
+// reachable, the first Pick() establishes a connection and returns it rather
+// than returning nil.
+func TestPick_EmptyPoolFillsSynchronously(t *testing.T) {
+	session := createTestSession()
+	host := &HostInfo{
+		connectAddress: net.IPv4(127, 0, 0, 1),
+		port:           9042,
+	}
+
+	pool := &hostConnPool{
+		session:            session,
+		host:               host,
+		port:               9042,
+		addr:               "127.0.0.1:9042",
+		size:               3,
+		keyspace:           "",
+		conns:              make([]*Conn, 0, 3),
+		expiredConns:       make([]*Conn, 0, maxDrainingConns),
+		filling:            false,
+		closed:             false,
+		maintenanceStarted: false,
+		maintenanceTicker:  100 * time.Millisecond,
+		// Reachable host: each attempt yields a fresh, non-expiring connection.
+		connFactory: func() (*Conn, error) {
+			return fakeConn(3, time.Now(), 0), nil
+		},
+	}
+
+	done := make(chan *Conn, 1)
+	go func() {
+		done <- pool.Pick()
+	}()
+
+	select {
+	case conn := <-done:
+		if conn == nil {
+			t.Fatal("expected Pick() to synchronously fill and return a connection")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pick() did not return within the timeout")
+	}
+}
